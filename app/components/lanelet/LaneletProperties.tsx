@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { Lanelet, LaneletSubType, LaneletTurn } from "./types";
+import type { Lanelet, LaneletTurn } from "./types";
 import type { JointType } from "./geometry";
 
 interface LaneletPropertiesProps {
@@ -63,12 +63,25 @@ export function LaneletProperties({
   const turn  = common("turnDirection");
   const speed = common("speedLimit");
 
+  // Turn direction and joints don't apply to crosswalks — they're a
+  // crossing area, not a directional travel lane. Hide those UI bits when
+  // every selected lanelet is a crosswalk.
+  const allCrosswalk = sub === "crosswalk";
+
+  const kindLabel = sub === "__mixed__"
+    ? "mixed"
+    : sub === "crosswalk"
+      ? "crosswalk"
+      : "lanelet";
+
   return (
     <div className="absolute top-20 right-5 flex flex-col gap-3 rounded-xl border border-white/10 bg-black/70 p-4 backdrop-blur-md w-64 pointer-events-auto">
 
       <div className="flex items-center justify-between">
         <div className="text-[10px] font-mono text-white/40 uppercase tracking-wider">
-          {single ? `Lanelet #${single.id}` : `${selected.length} lanelets`}
+          {single
+            ? `${kindLabel === "crosswalk" ? "Crosswalk" : "Lanelet"} #${single.id}`
+            : `${selected.length} ${kindLabel}s`}
         </div>
         <button
           onClick={onDeselectAll}
@@ -95,45 +108,37 @@ export function LaneletProperties({
         </span>
       </FieldRow>
 
-      {/* ── Sub-type ──────────────────────────────────────── */}
-      <FieldRow label="Type">
-        <select
-          value={sub === "__mixed__" ? "" : (sub as string)}
-          onChange={(e) =>
-            onUpdate(ids, { subType: e.target.value as LaneletSubType })
-          }
-          className="flex-1 bg-white/5 border border-white/10 rounded-md px-2 py-1 text-xs font-mono text-white/80 focus:outline-none focus:border-cyan-400/50 cursor-pointer"
-        >
-          {sub === "__mixed__" && <option value="">(mixed)</option>}
-          <option value="road">road</option>
-          <option value="crosswalk">crosswalk</option>
-        </select>
-      </FieldRow>
+      {/* Type is chosen by the drawing tool (Lanelet / Crosswalk buttons),
+          not a dropdown here — mirrors MapToolbox's "pick your tool, draw"
+          flow and avoids ambiguity like setting "crosswalk" on a lanelet
+          that's already been given turn/speed metadata. */}
 
-      {/* ── Turn direction ────────────────────────────────── */}
-      <FieldRow label="Turn">
-        <select
-          value={
-            turn === "__mixed__"
-              ? ""
-              : (turn as LaneletTurn) === null
-                ? "none"
-                : (turn as string)
-          }
-          onChange={(e) => {
-            const v = e.target.value;
-            const t: LaneletTurn = v === "none" ? null : (v as LaneletTurn);
-            onUpdate(ids, { turnDirection: t });
-          }}
-          className="flex-1 bg-white/5 border border-white/10 rounded-md px-2 py-1 text-xs font-mono text-white/80 focus:outline-none focus:border-cyan-400/50 cursor-pointer"
-        >
-          {turn === "__mixed__" && <option value="">(mixed)</option>}
-          <option value="none">none</option>
-          <option value="straight">straight</option>
-          <option value="left">left</option>
-          <option value="right">right</option>
-        </select>
-      </FieldRow>
+      {/* ── Turn direction (road lanelets only) ──────────── */}
+      {!allCrosswalk && (
+        <FieldRow label="Turn">
+          <select
+            value={
+              turn === "__mixed__"
+                ? ""
+                : (turn as LaneletTurn) === null
+                  ? "none"
+                  : (turn as string)
+            }
+            onChange={(e) => {
+              const v = e.target.value;
+              const t: LaneletTurn = v === "none" ? null : (v as LaneletTurn);
+              onUpdate(ids, { turnDirection: t });
+            }}
+            className="flex-1 bg-white/5 border border-white/10 rounded-md px-2 py-1 text-xs font-mono text-white/80 focus:outline-none focus:border-cyan-400/50 cursor-pointer"
+          >
+            {turn === "__mixed__" && <option value="">(mixed)</option>}
+            <option value="none">none</option>
+            <option value="straight">straight</option>
+            <option value="left">left</option>
+            <option value="right">right</option>
+          </select>
+        </FieldRow>
+      )}
 
       {/* ── Speed limit ──────────────────────────────────── */}
       <FieldRow label="Speed">
@@ -159,8 +164,8 @@ export function LaneletProperties({
         <span className="text-[10px] font-mono text-white/40 w-8">km/h</span>
       </FieldRow>
 
-      {/* ── Add neighbor (single selection only) ─────────── */}
-      {single && (
+      {/* ── Add neighbor (single road lanelet only) ─────── */}
+      {single && !allCrosswalk && (
         <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
           <div className="text-[10px] font-mono text-white/40 uppercase tracking-wider pt-2">
             Add neighbor
@@ -195,8 +200,8 @@ export function LaneletProperties({
         </div>
       )}
 
-      {/* ── Joint (single selection only) ────────────────── */}
-      {single && (() => {
+      {/* ── Joint (single road lanelet only) ────────────── */}
+      {single && !allCrosswalk && (() => {
         const others = lanelets.filter((l) => l.id !== single.id);
         const target = jointTargetId !== null
           ? others.find((l) => l.id === jointTargetId) ?? null
@@ -282,17 +287,20 @@ export function LaneletProperties({
 
       {/* ── Actions ───────────────────────────────────────── */}
       <div className="flex gap-2 pt-1">
-        <button
-          onClick={() => onReverse(ids)}
-          className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-white/60 border border-white/10 hover:text-white/90 hover:bg-white/5 transition-colors cursor-pointer"
-          title="Flip direction of travel"
-        >
-          <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round"
-              d="M7 16V4m0 0L3 8m4-4 4 4m6 0v12m0 0 4-4m-4 4-4-4" />
-          </svg>
-          Reverse
-        </button>
+        {/* Reverse is only meaningful for directional road lanelets. */}
+        {!allCrosswalk && (
+          <button
+            onClick={() => onReverse(ids)}
+            className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-white/60 border border-white/10 hover:text-white/90 hover:bg-white/5 transition-colors cursor-pointer"
+            title="Flip direction of travel"
+          >
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round"
+                d="M7 16V4m0 0L3 8m4-4 4 4m6 0v12m0 0 4-4m-4 4-4-4" />
+            </svg>
+            Reverse
+          </button>
+        )}
         <button
           onClick={() => onDelete(ids)}
           className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-red-300/80 border border-red-400/20 bg-red-500/5 hover:bg-red-500/15 hover:text-red-200 transition-colors cursor-pointer"

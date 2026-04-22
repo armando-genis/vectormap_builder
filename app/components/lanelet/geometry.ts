@@ -14,6 +14,7 @@
 import * as THREE from "three";
 import type {
   Lanelet,
+  LaneletSubType,
   NodeId,
   NodeRegistry,
   Vec3,
@@ -113,6 +114,12 @@ export interface CreateLaneletParams {
    * (e.g. `joinLanelets`) with a specific turn shape.
    */
   interiorCenters?: Vec3[];
+  /**
+   * What kind of lanelet this is — "road" (default) or "crosswalk". Chosen
+   * by the drawing tool, not after the fact. Crosswalks get a different
+   * visualisation (zebra stripes, no direction arrow) downstream.
+   */
+  subType?: LaneletSubType;
 }
 
 /**
@@ -141,6 +148,7 @@ export function createLanelet(
     endOverride,
     interiorCount = 2,
     interiorCenters,
+    subType = "road",
   } = params;
 
   // Axis: when an end is overridden we snap the relevant endpoint to the
@@ -244,7 +252,7 @@ export function createLanelet(
     leftBoundary:  leftIds,
     rightBoundary: rightIds,
     width,
-    subType: "road",
+    subType,
     turnDirection: null,
   };
 
@@ -256,14 +264,28 @@ export function createLanelet(
 // ---------------------------------------------------------------------------
 
 /**
- * Translate the boundary pair at `index` so its midpoint becomes `newCenter`.
- * Both left[index] and right[index] move by the same delta — shape stays
- * locally intact, neighbors at other indices untouched.
+ * Move the boundary pair at `index` so its midpoint becomes `newCenter`.
  *
- * `index` may be 0 (start), last (end), or any interior.
+ * Two modes, chosen by whether the index sits at a boundary of the lanelet:
  *
- * Shared nodes move everywhere they're referenced — that's how junctions
- * stay coherent with drags on connected lanelets.
+ *  - Endpoint (index 0 or last): TRANSLATE both left[index] and right[index]
+ *    by the same delta. Endpoints are the spots that can be shared with a
+ *    neighbor lanelet (pair-attach / junction), and translating keeps the
+ *    shared NodeIds coherent — drag one lanelet's end and its connected
+ *    neighbor follows.
+ *
+ *  - Interior (0 < index < last): RE-ANCHOR the pair at `newCenter`,
+ *    perpendicular to the local centerline tangent derived from the
+ *    neighboring control indices, at the pair's current XZ width. That's
+ *    what stops the ribbon from visibly changing width when you curve
+ *    the lanelet with the magenta squares: if we just translated, the
+ *    pair would stop being perpendicular to the new tangent and read
+ *    locally as a twist / pinch. Interior control nodes are always fresh
+ *    per lanelet (createLanelet calls addNode for them), so re-anchoring
+ *    never breaks a junction.
+ *
+ * Falls back to plain translation when the local tangent is degenerate
+ * (zero-length neighbor segment), so the pair can't collapse.
  */
 export function moveLaneletNodeAtIndex(
   reg: NodeRegistry,
@@ -271,6 +293,7 @@ export function moveLaneletNodeAtIndex(
   index: number,
   newCenter: Vec3
 ): { reg: NodeRegistry; lanelet: Lanelet } {
+  const n = lanelet.leftBoundary.length;
   const leftId  = lanelet.leftBoundary[index];
   const rightId = lanelet.rightBoundary[index];
   if (leftId === undefined || rightId === undefined) {
@@ -280,6 +303,44 @@ export function moveLaneletNodeAtIndex(
   const leftOld  = getNode(reg, leftId);
   const rightOld = getNode(reg, rightId);
 
+  const isInterior = index > 0 && index < n - 1;
+
+  if (isInterior) {
+    // Local centerline tangent from the immediate neighbors in XZ.
+    const lp = getNode(reg, lanelet.leftBoundary[index - 1]);
+    const rp = getNode(reg, lanelet.rightBoundary[index - 1]);
+    const ln = getNode(reg, lanelet.leftBoundary[index + 1]);
+    const rn = getNode(reg, lanelet.rightBoundary[index + 1]);
+    const prevCx = (lp[0] + rp[0]) * 0.5;
+    const prevCz = (lp[2] + rp[2]) * 0.5;
+    const nextCx = (ln[0] + rn[0]) * 0.5;
+    const nextCz = (ln[2] + rn[2]) * 0.5;
+    const tx = nextCx - prevCx;
+    const tz = nextCz - prevCz;
+    const tl = Math.hypot(tx, tz);
+
+    if (tl > 1e-6) {
+      // Current pair width (XZ), preserved across the re-anchor.
+      const wx = leftOld[0] - rightOld[0];
+      const wz = leftOld[2] - rightOld[2];
+      const width = Math.hypot(wx, wz);
+      // Left perpendicular of the tangent in XZ (Y up).
+      const px =  tz / tl;
+      const pz = -tx / tl;
+      const half = width * 0.5;
+      return {
+        reg: moveNodes(reg, {
+          [leftId]:  [newCenter[0] + px * half, newCenter[1], newCenter[2] + pz * half],
+          [rightId]: [newCenter[0] - px * half, newCenter[1], newCenter[2] - pz * half],
+        }),
+        lanelet,
+      };
+    }
+    // Degenerate tangent — fall through to the translate branch.
+  }
+
+  // Endpoint (or degenerate-interior) case: translate both nodes equally
+  // so any shared junction NodeIds move together with their neighbors.
   const oldCx = (leftOld[0]  + rightOld[0])  * 0.5;
   const oldCy = (leftOld[1]  + rightOld[1])  * 0.5;
   const oldCz = (leftOld[2]  + rightOld[2])  * 0.5;

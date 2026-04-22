@@ -34,7 +34,8 @@ const SMOOTH_SAMPLES_PER_SEGMENT = 12;
  * Output length = `samplesPerSegment * (ctrl.length - 1) + 1` for ctrl ≥ 2,
  * so the first and last samples coincide with the first and last control
  * nodes — important for the boundary polylines to start/end at the
- * junction NodeIds that neighbors share.
+ * junction NodeIds that neighbors share, so two connected lanelets'
+ * rendered edges meet exactly at the seam.
  */
 function smoothPolyline(
   ctrl: Vec3[],
@@ -42,7 +43,6 @@ function smoothPolyline(
 ): Vec3[] {
   if (ctrl.length < 2) return ctrl.map((p) => [p[0], p[1], p[2]] as Vec3);
   if (ctrl.length === 2) {
-    // CatmullRomCurve3 with 2 points is degenerate; straight line is fine.
     return [
       [ctrl[0][0], ctrl[0][1], ctrl[0][2]],
       [ctrl[1][0], ctrl[1][1], ctrl[1][2]],
@@ -256,10 +256,21 @@ export function resolveLanelet(
     ];
   }
 
-  // Smooth sampled polylines — centripetal Catmull–Rom through the control
-  // nodes. These are what LaneletLayer actually renders (fill strip,
-  // boundary lines, centerline). Drag handles keep using `centerline` above
-  // because handles belong at real control nodes, not mid-spline samples.
+  // Render-time geometry: each boundary is its own Catmull–Rom spline
+  // through the STORED NodeIds. That guarantees seams between connected
+  // lanelets blend cleanly — both sides pass exactly through the shared
+  // junction NodeIds at their first/last control index, so there's no
+  // gap at an L-junction where the two lanelets meet at an angle.
+  //
+  // The "width drifts when I curve the lanelet" issue is handled at drag
+  // time (moveLaneletNodeAtIndex in geometry.ts), which re-anchors the
+  // interior boundary pair perpendicular to the new local tangent so the
+  // control polylines stay close to true perpendicular offsets.
+  //
+  // centerSmooth is the per-sample midpoint of the two boundary splines,
+  // not an independent Catmull-Rom through the centerline control points.
+  // That keeps the rendered arrow/centerline visually consistent with the
+  // ribbon edges it lives between.
   const leftSmooth  = smoothPolyline(leftPos);
   const rightSmooth = smoothPolyline(rightPos);
   const m = leftSmooth.length;

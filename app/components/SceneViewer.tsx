@@ -40,7 +40,10 @@ import type {
 } from "./lanelet/types";
 
 type CameraMode = "3d" | "2d";
-type Tool       = "view" | "lanelet";
+// "view"      = selection/edit.
+// "lanelet"   = draw a road lanelet.
+// "crosswalk" = draw a crosswalk (no direction arrow, zebra-striped fill).
+type Tool       = "view" | "lanelet" | "crosswalk";
 
 interface SceneProps {
   geometry: THREE.BufferGeometry | null;
@@ -384,6 +387,8 @@ function Scene({
       attachDistance: ATTACH_DISTANCE,
       startOverride: pendingStartSnap ?? undefined,
       endOverride:   endSnap ?? undefined,
+      // Tool chooses the kind of lanelet being drawn.
+      subType: tool === "crosswalk" ? "crosswalk" : "road",
     });
 
     onFinishLanelet(reg, lanelet);
@@ -437,7 +442,7 @@ function Scene({
           voxelSize={voxelSize}
           cameraMode={cameraMode}
           zCeiling={zCeiling}
-          pickEnabled={tool === "lanelet"}
+          pickEnabled={tool === "lanelet" || tool === "crosswalk"}
           onPick={handlePick}
           pointsRef={pointsRef}
         />
@@ -514,7 +519,9 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
   }, [geometry]);
 
   useEffect(() => {
-    if (tool === "lanelet") setSelectedIds(new Set());
+    // Any drawing tool clears the current selection so clicks don't
+    // accidentally toggle selection while you're trying to place points.
+    if (tool !== "view") setSelectedIds(new Set());
   }, [tool]);
 
   // --------------------------------------------------------------------
@@ -689,14 +696,22 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingStart, selectedIds]);
 
-  const toggleTool = () => {
-    if (tool === "lanelet") {
+  /**
+   * Toolbar button behaviour: clicking the same tool that's already active
+   * turns it off (back to "view"); clicking a different tool switches to
+   * it and discards any half-drawn pending start — otherwise the first
+   * click of a crosswalk would connect back to a lanelet's pending start.
+   */
+  const pickTool = (next: Tool) => {
+    if (tool === next) {
       setTool("view");
       setPendingStart(null);
       setPendingStartSnap(null);
-    } else {
-      setTool("lanelet");
+      return;
     }
+    setTool(next);
+    setPendingStart(null);
+    setPendingStartSnap(null);
   };
 
   const handleStartLanelet = (p: Vec3, snap: LaneletEndSnap | null) => {
@@ -824,7 +839,7 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
         <div className="text-[10px] font-mono text-white/40 uppercase tracking-wider">Tool</div>
 
         <button
-          onClick={toggleTool}
+          onClick={() => pickTool("lanelet")}
           className={`flex items-center justify-between px-3 py-2 rounded-md text-xs font-mono transition-colors cursor-pointer border
             ${tool === "lanelet"
               ? "bg-cyan-500/20 text-cyan-300 border-cyan-400/40"
@@ -837,9 +852,28 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
               <path strokeLinecap="round" strokeLinejoin="round"
                 d="M12 6 L12 18" strokeDasharray="1.5 1.5" />
             </svg>
-            Add lanelet
+            Lanelet
           </span>
           <span className="text-[10px] text-white/40">{tool === "lanelet" ? "ON" : "OFF"}</span>
+        </button>
+
+        <button
+          onClick={() => pickTool("crosswalk")}
+          className={`flex items-center justify-between px-3 py-2 rounded-md text-xs font-mono transition-colors cursor-pointer border
+            ${tool === "crosswalk"
+              ? "bg-sky-500/20 text-sky-300 border-sky-400/40"
+              : "bg-white/5 text-white/60 border-white/10 hover:text-white/80 hover:bg-white/10"}`}
+        >
+          <span className="flex items-center gap-2">
+            {/* Zebra-stripe glyph — a rectangle with vertical bars, matching
+                the on-canvas crosswalk look. */}
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={1.6} viewBox="0 0 24 24">
+              <rect x="4" y="5" width="16" height="14" rx="1" />
+              <path d="M8 5v14M12 5v14M16 5v14" />
+            </svg>
+            Crosswalk
+          </span>
+          <span className="text-[10px] text-white/40">{tool === "crosswalk" ? "ON" : "OFF"}</span>
         </button>
 
         <div className="flex flex-col gap-1.5 pt-1">
@@ -868,7 +902,10 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
         </div>
 
         {pendingStart && (
-          <div className="rounded-md bg-cyan-500/10 border border-cyan-400/30 px-2.5 py-1.5 text-[10px] font-mono text-cyan-300 leading-4">
+          <div className={`rounded-md px-2.5 py-1.5 text-[10px] font-mono leading-4 border
+            ${tool === "crosswalk"
+              ? "bg-sky-500/10 border-sky-400/30 text-sky-300"
+              : "bg-cyan-500/10 border-cyan-400/30 text-cyan-300"}`}>
             Click the end point…
             <br />
             <span className="text-white/50">Esc to cancel</span>
@@ -982,14 +1019,14 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
 
       {/* ── Hint ─────────────────────────────────────────────── */}
       <div className="absolute bottom-5 right-5 text-right pointer-events-none">
-        {tool === "lanelet" ? (
+        {tool !== "view" ? (
           pendingStart ? (
-            <p className="text-[10px] text-cyan-300/80 font-mono leading-5">
-              Click the end of the lanelet · Esc to cancel
+            <p className={`text-[10px] font-mono leading-5 ${tool === "crosswalk" ? "text-sky-300/80" : "text-cyan-300/80"}`}>
+              Click the end of the {tool} · Esc to cancel
             </p>
           ) : (
-            <p className="text-[10px] text-cyan-300/80 font-mono leading-5">
-              Click the start of the lanelet ({width.toFixed(1)} m wide)
+            <p className={`text-[10px] font-mono leading-5 ${tool === "crosswalk" ? "text-sky-300/80" : "text-cyan-300/80"}`}>
+              Click the start of the {tool} ({width.toFixed(1)} m wide)
             </p>
           )
         ) : selectedIds.size > 0 ? (
