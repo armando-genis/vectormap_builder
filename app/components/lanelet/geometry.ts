@@ -311,23 +311,32 @@ export function snapLaneletToSurface(
 
 /**
  * Widen / narrow a lanelet by reseating each boundary pair at `newWidth`
- * around its current centerline index-point. Allocates fresh NodeIds for
- * every index — this detaches the lanelet from any junction neighbor at
- * all ends (we can't widen shared nodes without deforming the neighbor).
+ * around its current centerline index-point.
+ *
+ * We MOVE the existing boundary NodeIds to their new positions rather than
+ * allocating fresh ones. Consequence: any NodeId shared with a neighboring
+ * lanelet (i.e. a junction) stays shared — the neighbor's corresponding
+ * corner is pulled along, and the junction remains intact. This is what
+ * the user expects when widening lane B that connects to lane A: they
+ * stay connected; the end of A just widens to match.
  *
  * The local perpendicular at each index is derived from the centerline's
- * tangent (previous → next midpoint), so curves still widen cleanly.
+ * tangent (previous → next midpoint), so curves widen cleanly along the
+ * spine direction instead of around the chord.
+ *
+ * `_nextNodeId` is kept in the signature for API compatibility; no new
+ * nodes are allocated here.
  */
 export function resizeLaneletWidth(
   reg: NodeRegistry,
-  nextNodeId: { current: number },
+  _nextNodeId: { current: number },
   lanelet: Lanelet,
   newWidth: number
 ): { reg: NodeRegistry; lanelet: Lanelet } {
   const n = lanelet.leftBoundary.length;
   const half = newWidth / 2;
 
-  // Current centerline (index-by-index midpoint)
+  // Current centerline (index-by-index midpoint of the two boundary nodes).
   const center: Vec3[] = new Array(n);
   for (let i = 0; i < n; i++) {
     const l = getNode(reg, lanelet.leftBoundary[i]);
@@ -335,39 +344,84 @@ export function resizeLaneletWidth(
     center[i] = midpoint(l, r);
   }
 
-  // Per-index tangent → perpendicular. Use neighbor segments so the first
-  // and last indices use their adjacent segment's direction.
+  // Per-index tangent → left-perpendicular. Endpoints use their single
+  // adjacent segment; interior indices average the two neighbor segments
+  // via the prev→next midpoint direction.
   const tangentLeftPerp = (i: number): [number, number] => {
     const a = center[Math.max(0, i - 1)];
     const b = center[Math.min(n - 1, i + 1)];
     return leftPerpXZ(a, b);
   };
 
-  let reg1 = reg;
-  const alloc = (pos: Vec3): NodeId => {
-    const { reg: r2, id } = addNode(reg1, pos, nextNodeId);
-    reg1 = r2;
-    return id;
-  };
-
-  const leftIds:  NodeId[] = new Array(n);
-  const rightIds: NodeId[] = new Array(n);
+  // Build a single atomic position update — one per NodeId. If both
+  // boundaries somehow alias the same NodeId (shouldn't happen, but be
+  // safe), the last write wins and that's still a sane outcome.
+  const updates: Record<NodeId, Vec3> = {};
   for (let i = 0; i < n; i++) {
     const [lx, lz] = tangentLeftPerp(i);
     const c = center[i];
-    leftIds[i]  = alloc([c[0] + lx * half, c[1], c[2] + lz * half]);
-    rightIds[i] = alloc([c[0] - lx * half, c[1], c[2] - lz * half]);
+    const leftId  = lanelet.leftBoundary[i];
+    const rightId = lanelet.rightBoundary[i];
+    updates[leftId]  = [c[0] + lx * half, c[1], c[2] + lz * half];
+    updates[rightId] = [c[0] - lx * half, c[1], c[2] - lz * half];
   }
 
   return {
-    reg: reg1,
-    lanelet: {
-      ...lanelet,
-      width: newWidth,
-      leftBoundary:  leftIds,
-      rightBoundary: rightIds,
-    },
+    reg: moveNodes(reg, updates),
+    lanelet: { ...lanelet, width: newWidth },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Editing: translate the whole lanelet
+// ---------------------------------------------------------------------------
+
+/**
+ * Shift every boundary NodeId by `delta`. Deduped so a NodeId referenced
+ * by both sides (pathological) still moves exactly once.
+ *
+ * Semantic note: shared NodeIds at a junction move too, which pulls any
+ * neighboring lanelet's connected corner along with this drag. That is
+ * deliberate — the junction stays a junction. The UI flow for "move just
+ * this lanelet, detaching it" should handle detachment *before* calling
+ * this (e.g. duplicate-out the shared NodeIds into private ones first).
+ */
+export function translateLanelet(
+  reg: NodeRegistry,
+  lanelet: Lanelet,
+  delta: Vec3
+): { reg: NodeRegistry; lanelet: Lanelet } {
+  const seen = new Set<NodeId>();
+  const updates: Record<NodeId, Vec3> = {};
+  const translateId = (id: NodeId) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    const p = getNode(reg, id);
+    updates[id] = [p[0] + delta[0], p[1] + delta[1], p[2] + delta[2]];
+  };
+  for (const id of lanelet.leftBoundary)  translateId(id);
+  for (const id of lanelet.rightBoundary) translateId(id);
+  return { reg: moveNodes(reg, updates), lanelet };
+}
+
+/**
+ * Set every boundary NodeId to `snapshot[id] + delta`. Absolute / stateless
+ * variant of `translateLanelet` used by the live drag loop — each pointer
+ * move applies `delta` against the pointer-down snapshot, which keeps the
+ * result idempotent (no accumulated floating-point drift) even if the drag
+ * re-runs many times per second.
+ */
+export function applyLaneletTranslationFromSnapshot(
+  reg: NodeRegistry,
+  snapshot: Record<NodeId, Vec3>,
+  delta: Vec3
+): NodeRegistry {
+  const updates: Record<NodeId, Vec3> = {};
+  for (const [k, p] of Object.entries(snapshot)) {
+    const id = Number(k);
+    updates[id] = [p[0] + delta[0], p[1] + delta[1], p[2] + delta[2]];
+  }
+  return moveNodes(reg, updates);
 }
 
 // ---------------------------------------------------------------------------

@@ -6,8 +6,10 @@ import { OrbitControls, Grid, Stats } from "@react-three/drei";
 import * as THREE from "three";
 import { PointCloud } from "./PointCloud";
 import { LaneletLayer } from "./lanelet/LaneletLayer";
+import type { DragHandleState } from "./lanelet/LaneletLayer";
 import { LaneletProperties } from "./lanelet/LaneletProperties";
 import {
+  applyLaneletTranslationFromSnapshot,
   createLanelet,
   duplicateLaneletLeft,
   duplicateLaneletRight,
@@ -29,6 +31,7 @@ import {
 import type { LaneletEndSnap } from "./lanelet/registry";
 import type {
   Lanelet,
+  NodeId,
   NodeRegistry,
   ResolvedLanelet,
   Vec3,
@@ -102,13 +105,14 @@ function Scene({
   useEffect(() => { registryRef.current = registry;   }, [registry]);
   useEffect(() => { onUpsertRef.current = onUpsertLanelet; }, [onUpsertLanelet]);
 
-  // `index` is a position in the lanelet's centerline polyline:
-  //   0           → start endpoint
-  //   last        → end endpoint
-  //   everything in between → interior shape-control node
-  const [dragHandle, setDragHandle] = useState<
-    { id: number; index: number } | null
-  >(null);
+  // Two flavors of drag:
+  //   kind "node": a single centerline control node (index 0 = start,
+  //                last = end, otherwise an interior shape-control) —
+  //                width-preserving local edit.
+  //   kind "move": the whole lanelet is translated rigidly; shared
+  //                junction nodes pull connected neighbors along.
+  const [dragHandle, setDragHandle] =
+    useState<DragHandleState | null>(null);
 
   const surfaceRc = useMemo(() => new THREE.Raycaster(), []);
 
@@ -153,15 +157,26 @@ function Scene({
   }, [geometry, cameraMode, camera]);
 
   // --------------------------------------------------------------------
-  // Drag handles — translate a single centerline node (endpoint or interior
-  // shape-control). The two boundary nodes at that index move by the same
-  // delta. Shared NodeIds cascade the move to any connected neighbor, so
-  // junctions stay coherent without extra bookkeeping; interior drags bend
-  // only the lanelet being edited.
+  // Drag handles.
+  //
+  // Two flavors — "node" (single control-node edit, keeps the lanelet's
+  // width) and "move" (whole-lanelet rigid translation, pulls connected
+  // neighbors along at shared junctions). Both share the same drag-plane
+  // infrastructure: a horizontal XZ plane at the handle's current Y, with
+  // OrbitControls disabled for the duration of the drag.
+  //
+  // "move" uses a pointer-down snapshot of every boundary NodeId's
+  // position; each pointermove recomputes absolute positions as
+  // `snapshot[id] + delta`, which keeps the drag idempotent (no drift).
   // --------------------------------------------------------------------
   const handleHandlePointerDown = (id: number, index: number) => {
     if (controlsRef.current) controlsRef.current.enabled = false;
-    setDragHandle({ id, index });
+    setDragHandle({ kind: "node", id, index });
+  };
+
+  const handleMoveHandlePointerDown = (id: number) => {
+    if (controlsRef.current) controlsRef.current.enabled = false;
+    setDragHandle({ kind: "move", id });
   };
 
   useEffect(() => {
@@ -181,15 +196,35 @@ function Scene({
       return;
     }
 
-    // Drag plane Y = current midpoint Y of the two boundary nodes at this
-    // index. Derived here (not read off the lanelet) because the centerline
-    // is no longer stored — it's always computed from the registry.
-    const reg0    = registryRef.current;
-    const leftId  = initial.leftBoundary[dragHandle.index];
-    const rightId = initial.rightBoundary[dragHandle.index];
-    const leftP   = leftId  !== undefined ? reg0.nodes[leftId]  : undefined;
-    const rightP  = rightId !== undefined ? reg0.nodes[rightId] : undefined;
-    const planeY  = leftP && rightP ? (leftP[1] + rightP[1]) * 0.5 : 0;
+    const reg0 = registryRef.current;
+
+    // Drag plane Y — and, for "move", also a snapshot of every boundary
+    // node's starting position (used for absolute drag arithmetic).
+    let planeY = 0;
+    const snapshot: Record<NodeId, Vec3> = {};
+
+    if (dragHandle.kind === "node") {
+      const leftId  = initial.leftBoundary[dragHandle.index];
+      const rightId = initial.rightBoundary[dragHandle.index];
+      const leftP   = leftId  !== undefined ? reg0.nodes[leftId]  : undefined;
+      const rightP  = rightId !== undefined ? reg0.nodes[rightId] : undefined;
+      planeY = leftP && rightP ? (leftP[1] + rightP[1]) * 0.5 : 0;
+    } else {
+      // "move" — plane at centroid Y, snapshot every node we're about to
+      // translate. Dedupe via the object so aliased NodeIds land once.
+      let sumY = 0;
+      let count = 0;
+      const allIds = [...initial.leftBoundary, ...initial.rightBoundary];
+      for (const id of allIds) {
+        if (snapshot[id]) continue;
+        const p = reg0.nodes[id];
+        if (!p) continue;
+        snapshot[id] = [p[0], p[1], p[2]];
+        sumY += p[1];
+        count++;
+      }
+      planeY = count > 0 ? sumY / count : 0;
+    }
 
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -planeY);
     const dragRc = new THREE.Raycaster();
@@ -206,6 +241,10 @@ function Scene({
       return [p.x, planeY, p.z];
     };
 
+    // "move" uses the first pointermove as its anchor — set lazily so we
+    // don't need access to the original pointerdown coordinates.
+    let moveAnchor: Vec3 | null = null;
+
     const onMove = (e: PointerEvent) => {
       document.body.style.cursor = "grabbing";
 
@@ -215,13 +254,32 @@ function Scene({
       const curr = laneletsRef.current.find((l) => l.id === dragHandle.id);
       if (!curr) return;
 
-      const { reg, lanelet } = moveLaneletNodeAtIndex(
-        registryRef.current,
-        curr,
-        dragHandle.index,
-        np
-      );
-      onUpsertRef.current(reg, lanelet);
+      if (dragHandle.kind === "node") {
+        const { reg, lanelet } = moveLaneletNodeAtIndex(
+          registryRef.current,
+          curr,
+          dragHandle.index,
+          np
+        );
+        onUpsertRef.current(reg, lanelet);
+      } else {
+        if (!moveAnchor) {
+          moveAnchor = np;
+          return;
+        }
+        const delta: Vec3 = [
+          np[0] - moveAnchor[0],
+          np[1] - moveAnchor[1],
+          np[2] - moveAnchor[2],
+        ];
+        const newReg = applyLaneletTranslationFromSnapshot(
+          registryRef.current,
+          snapshot,
+          delta
+        );
+        // Lanelet object itself is unchanged — only node positions moved.
+        onUpsertRef.current(newReg, curr);
+      }
     };
 
     const onUp = () => {
@@ -390,6 +448,7 @@ function Scene({
         onSelect={onSelect}
         editable={tool === "view"}
         onHandlePointerDown={handleHandlePointerDown}
+        onMoveHandlePointerDown={handleMoveHandlePointerDown}
         activeDragHandle={dragHandle}
         pendingStart={pendingStart}
         pendingStartAttached={pendingStartSnap !== null}
@@ -414,7 +473,7 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
   const [voxelSize,     setVoxelSize]     = useState(0);
   const [showStats,     setShowStats]     = useState(false);
   const [tool,          setTool]          = useState<Tool>("view");
-  const [width,         setWidth]         = useState(2);
+  const [width,         setWidth]         = useState(3);
 
   const [lanelets,     setLanelets]     = useState<Lanelet[]>([]);
   const [registry,     setRegistry]     = useState<NodeRegistry>(createRegistry());

@@ -30,6 +30,16 @@ const FILL_OPACITY_SELECTED = 0.45;
 const LINE_COLOR            = "#ffffff";
 const LINE_COLOR_SELECTED   = "#22d3ee";
 
+/**
+ * Discriminator for what's being dragged:
+ *  - `node`: a single centerline control node at `index` (endpoint or
+ *    interior shape-control). Width-preserving local edit.
+ *  - `move`: the entire lanelet, translated rigidly by the pointer delta.
+ */
+export type DragHandleState =
+  | { kind: "node"; id: number; index: number }
+  | { kind: "move"; id: number };
+
 interface LaneletLayerProps {
   lanelets: ResolvedLanelet[];
   selectedIds: Set<number>;
@@ -39,8 +49,10 @@ interface LaneletLayerProps {
   /** Enables drag handles on selected lanelets' centerline indices. */
   editable: boolean;
   onHandlePointerDown: (id: number, index: number) => void;
-  /** Which lanelet/index is being dragged, if any. */
-  activeDragHandle: { id: number; index: number } | null;
+  /** Enables the green "move whole lanelet" handle on selected lanelets. */
+  onMoveHandlePointerDown: (id: number) => void;
+  /** Which handle is currently being dragged, if any. */
+  activeDragHandle: DragHandleState | null;
   pendingStart: Vec3 | null;
   pendingStartAttached: boolean;
   sceneRadius: number;
@@ -54,13 +66,14 @@ export function LaneletLayer({
   onSelect,
   editable,
   onHandlePointerDown,
+  onMoveHandlePointerDown,
   activeDragHandle,
   pendingStart,
   pendingStartAttached,
   sceneRadius,
   junctionPositions,
 }: LaneletLayerProps) {
-  const arrowSize = Math.min(Math.max(0.3, sceneRadius / 150), 5) * 0.4;
+  const arrowSize = Math.min(Math.max(0.3, sceneRadius / 150), 5) * 0.2;
 
   return (
     <>
@@ -76,6 +89,7 @@ export function LaneletLayer({
             arrowSize={arrowSize}
             showHandles={editable && isSelected}
             onHandlePointerDown={onHandlePointerDown}
+            onMoveHandlePointerDown={onMoveHandlePointerDown}
             activeDragHandle={activeDragHandle}
           />
         );
@@ -108,7 +122,8 @@ interface LaneletMeshProps {
   arrowSize: number;
   showHandles: boolean;
   onHandlePointerDown: (id: number, index: number) => void;
-  activeDragHandle: { id: number; index: number } | null;
+  onMoveHandlePointerDown: (id: number) => void;
+  activeDragHandle: DragHandleState | null;
 }
 
 function LaneletMesh({
@@ -119,6 +134,7 @@ function LaneletMesh({
   arrowSize,
   showHandles,
   onHandlePointerDown,
+  onMoveHandlePointerDown,
   activeDragHandle,
 }: LaneletMeshProps) {
   const {
@@ -266,8 +282,9 @@ function LaneletMesh({
           key={i}
           pos={pos}
           active={
-            activeDragHandle?.id === lanelet.id &&
-            activeDragHandle?.index === i
+            activeDragHandle?.kind === "node" &&
+            activeDragHandle.id === lanelet.id &&
+            activeDragHandle.index === i
           }
           /* Endpoints (first/last) get the cyan palette; interior shape
              controls are a slightly different pink so they're easier to
@@ -276,6 +293,17 @@ function LaneletMesh({
           onPointerDown={() => onHandlePointerDown(lanelet.id, i)}
         />
       ))}
+
+      {showHandles && (
+        <MoveHandle
+          pos={centerSmooth[Math.floor(nSmo / 2)]}
+          active={
+            activeDragHandle?.kind === "move" &&
+            activeDragHandle.id === lanelet.id
+          }
+          onPointerDown={() => onMoveHandlePointerDown(lanelet.id)}
+        />
+      )}
     </>
   );
 }
@@ -401,6 +429,97 @@ function LaneletHandle({ pos, active, interior, onPointerDown }: LaneletHandlePr
         onPointerOver={(e) => {
           e.stopPropagation();
           document.body.style.cursor = active ? "grabbing" : "grab";
+        }}
+        onPointerOut={() => {
+          if (!active) document.body.style.cursor = "";
+        }}
+      >
+        <sphereGeometry args={[1, 10, 10]} />
+        <meshBasicMaterial
+          transparent
+          opacity={0}
+          depthTest={false}
+          depthWrite={false}
+        />
+      </mesh>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Move-lanelet handle — green, larger, at the mid-point of the smooth
+// centerline. Dragging it translates every boundary NodeId of this lanelet
+// by the pointer delta (connected neighbors follow at shared junctions).
+// ---------------------------------------------------------------------------
+interface MoveHandleProps {
+  pos: Vec3;
+  active: boolean;
+  onPointerDown: () => void;
+}
+
+const MOVE_HANDLE_HIT_PIXELS = 18;
+
+function MoveHandle({ pos, active, onPointerDown }: MoveHandleProps) {
+  const dotGeo = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute(
+      "position",
+      new THREE.BufferAttribute(new Float32Array(pos), 3)
+    );
+    return g;
+  }, [pos]);
+
+  const hitRef = useRef<THREE.Mesh>(null);
+  const tmpVec = useMemo(() => new THREE.Vector3(), []);
+
+  useFrame(({ camera, size }) => {
+    const mesh = hitRef.current;
+    if (!mesh) return;
+    mesh.getWorldPosition(tmpVec);
+    const distance = camera.position.distanceTo(tmpVec);
+    const cam = camera as THREE.PerspectiveCamera;
+    const fovRad = (cam.fov * Math.PI) / 180;
+    const worldPerPixel = (2 * distance * Math.tan(fovRad / 2)) / size.height;
+    mesh.scale.setScalar(worldPerPixel * MOVE_HANDLE_HIT_PIXELS);
+  });
+
+  const haloColor = active ? "#f59e0b" : "#10b981"; // amber when dragging, emerald otherwise
+  const coreColor = active ? "#fef3c7" : "#d1fae5";
+
+  return (
+    <>
+      <points geometry={dotGeo} renderOrder={RO_HANDLE}>
+        <pointsMaterial
+          size={26}
+          sizeAttenuation={false}
+          color={haloColor}
+          transparent
+          opacity={0.55}
+          depthTest={false}
+          depthWrite={false}
+        />
+      </points>
+      <points geometry={dotGeo} renderOrder={RO_HANDLE + 1}>
+        <pointsMaterial
+          size={14}
+          sizeAttenuation={false}
+          color={coreColor}
+          transparent
+          depthTest={false}
+          depthWrite={false}
+        />
+      </points>
+      <mesh
+        ref={hitRef}
+        position={pos}
+        renderOrder={RO_HANDLE + 2}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          onPointerDown();
+        }}
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          document.body.style.cursor = active ? "grabbing" : "move";
         }}
         onPointerOut={() => {
           if (!active) document.body.style.cursor = "";
