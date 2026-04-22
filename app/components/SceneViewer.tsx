@@ -5,7 +5,8 @@ import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls, Grid, Stats } from "@react-three/drei";
 import * as THREE from "three";
 import { PointCloud } from "./PointCloud";
-import type { CropRegion, PointCloudStats } from "./PointCloud";
+import type { CropRegion } from "./PointCloud";
+import type { PointCloudChunk, PointCloudStats } from "./types";
 import { LaneletLayer } from "./lanelet/LaneletLayer";
 import type { DragHandleState } from "./lanelet/LaneletLayer";
 import { LaneletProperties } from "./lanelet/LaneletProperties";
@@ -51,8 +52,10 @@ type Tool       = "view" | "lanelet" | "crosswalk" | "crop-center";
 
 interface SceneProps {
   geometry: THREE.BufferGeometry | null;
+  /** Rendered cloud tiles. Produced by the worker owned by the outer
+   *  `PointCloudViewer`; this component is a pure renderer of them. */
+  chunks: PointCloudChunk[];
   pointSize: number;
-  voxelSize: number;
   zCeiling: number;
   cameraMode: CameraMode;
   tool: Tool;
@@ -85,16 +88,12 @@ interface SceneProps {
   onUpsertLanelet: (reg: NodeRegistry, l: Lanelet) => void;
 
   nextLaneletIdRef: React.MutableRefObject<number>;
-
-  /** Forwarded to <PointCloud> — surfaces chunking / voxel progress back
-   *  to the outer stats pill. */
-  onStatsChange?: (stats: PointCloudStats) => void;
 }
 
 function Scene({
   geometry,
+  chunks,
   pointSize,
-  voxelSize,
   zCeiling,
   cameraMode,
   tool,
@@ -114,7 +113,6 @@ function Scene({
   onFinishLanelet,
   onUpsertLanelet,
   nextLaneletIdRef,
-  onStatsChange,
 }: SceneProps) {
   const { camera, raycaster, gl } = useThree();
   const controlsRef = useRef<any>(null);
@@ -468,9 +466,8 @@ function Scene({
 
       {geometry && (
         <PointCloud
-          geometry={geometry}
+          chunks={chunks}
           pointSize={pointSize}
-          voxelSize={voxelSize}
           cameraMode={cameraMode}
           zCeiling={zCeiling}
           cropRegion={cropRegion}
@@ -481,7 +478,6 @@ function Scene({
           }
           onPick={handlePick}
           pointsRef={pointsRef}
-          onStatsChange={onStatsChange}
         />
       )}
 
@@ -620,19 +616,31 @@ function CropBox({ cropRegion, zCeiling, floorY }: CropBoxProps) {
 
 interface SceneViewerProps {
   geometry: THREE.BufferGeometry | null;
+  /** Rendered cloud tiles. Owned/produced by the parent's worker. */
+  chunks: PointCloudChunk[];
   fileName: string;
-  pointCount: number;
+  /** Voxel downsample size controlled by the slider below. Lives at the
+   *  parent level so voxel changes post directly to the parent's worker
+   *  without re-transferring the cloud. */
+  voxelSize: number;
+  onVoxelSizeChange: (v: number) => void;
+  /** Live status from the parent's worker pipeline. */
+  cloudStats: PointCloudStats | null;
   onReset: () => void;
 }
 
-export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneViewerProps) {
+export function SceneViewer({
+  geometry,
+  chunks,
+  fileName,
+  voxelSize,
+  onVoxelSizeChange,
+  cloudStats,
+  onReset,
+}: SceneViewerProps) {
   const [cameraMode,    setCameraMode]    = useState<CameraMode>("3d");
   const [pointSize3d,   setPointSize3d]   = useState(0.03);
   const [pointSize2d,   setPointSize2d]   = useState(2);
-  const [voxelSize,     setVoxelSize]     = useState(0);
-  // Live status from the PointCloud worker pipeline (voxel + chunking).
-  // Null until first ingest completes.
-  const [cloudStats,    setCloudStats]    = useState<PointCloudStats | null>(null);
   const [showStats,     setShowStats]     = useState(false);
   const [tool,          setTool]          = useState<Tool>("view");
   const [width,         setWidth]         = useState(3);
@@ -1016,8 +1024,8 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
       >
         <Scene
           geometry={geometry}
+          chunks={chunks}
           pointSize={pointSize}
-          voxelSize={voxelSize}
           zCeiling={zCeiling}
           cameraMode={cameraMode}
           tool={tool}
@@ -1037,7 +1045,6 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
           onFinishLanelet={handleFinishLanelet}
           onUpsertLanelet={handleUpsertLanelet}
           nextLaneletIdRef={nextLaneletIdRef}
-          onStatsChange={setCloudStats}
         />
         {showStats && <Stats className="!left-auto !right-4 !top-4" />}
       </Canvas>
@@ -1127,7 +1134,7 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
                 </span>
               ) : (
                 <span className="text-xs text-white/50 font-mono">
-                  {pointCount.toLocaleString()} pts
+                  cloud
                 </span>
               )}
             </div>
@@ -1477,7 +1484,7 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
           <input
             type="range" min="0" max="0.5" step="0.01"
             value={voxelSize}
-            onChange={(e) => setVoxelSize(parseFloat(e.target.value))}
+            onChange={(e) => onVoxelSizeChange(parseFloat(e.target.value))}
             className="w-24 accent-cyan-400 cursor-pointer"
           />
           <span className={`text-xs font-mono w-10 ${voxelSize > 0 ? "text-cyan-400" : "text-white/30"}`}>

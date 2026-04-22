@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo } from "react";
 import type { RefObject } from "react";
 import * as THREE from "three";
-import type { ChunkOut, InMsg, OutMsg } from "./pointCloudWorker";
+import type { PointCloudChunk } from "./types";
 
 /**
  * Oriented, optionally tilted clip volume. When a `CropRegion` is passed
@@ -45,20 +45,15 @@ export interface CropRegion {
   roll:  number;
 }
 
-/** Status surfaced to the parent (e.g. to show a status pill). */
-export interface PointCloudStats {
-  phase:       "idle" | "processing" | "ready" | "error";
-  rawPoints:   number;   // points in the loaded PCD
-  voxelPoints: number;   // points after voxel downsampling
-  chunkCount:  number;   // how many spatial tiles we're rendering
-  progress:    number | null; // 0..1 while `phase === "processing"`, else null
-  message?:    string;
-}
+// `PointCloudChunk` lives in `./types` so `PointCloudViewer` can construct
+// chunks without also dragging in the renderer (and its whole Three.js
+// material closure). This component is intentionally the "pure renderer"
+// side of that split — no worker, no parsing, no downsampling.
 
 interface PointCloudProps {
-  geometry: THREE.BufferGeometry;
+  /** Rendered chunks. Pass an empty array while the worker is still busy. */
+  chunks: PointCloudChunk[];
   pointSize?: number;
-  voxelSize?: number;   // 0 = disabled
   cameraMode?: "3d" | "2d";
   /**
    * Height ceiling in world Y.
@@ -85,52 +80,17 @@ interface PointCloudProps {
    * tile at once.
    */
   pointsRef?: RefObject<THREE.Group | null>;
-  /** Approx points per spatial chunk. More chunks = better culling, more draw calls. */
-  targetChunkPoints?: number;
-  /** Notified on every status change (loading → ready, progress ticks, …). */
-  onStatsChange?: (stats: PointCloudStats) => void;
-}
-
-// ---------------------------------------------------------------------------
-// Main-thread <-> worker bridge.
-//
-// Chunking + voxel downsampling both used to run synchronously on the
-// main thread, which for a ~100 M-point cloud froze the UI for 5-10 s.
-// Everything heavy now runs in a module worker; the render tree only
-// mounts chunk <points> once buffers land back here (zero-copy via
-// transferables). The component survives voxel-slider drags by sending
-// tiny `{ type: "voxel" }` deltas instead of re-transferring the cloud.
-// ---------------------------------------------------------------------------
-
-/** Debounce the voxel slider so a rapid drag doesn't thrash the worker. */
-const VOXEL_DEBOUNCE_MS = 120;
-
-/** Target points per spatial tile — tuned so mid-size clouds (~1 M pts)
- *  end up with a few dozen chunks. Frustum-cull and ray-picking both
- *  scale linearly with chunk count, so a handful-to-hundreds is ideal. */
-const DEFAULT_TARGET_CHUNK_POINTS = 25_000;
-
-/** Clone a Float32Array-compatible view into a fresh Float32Array so we
- *  can transfer it to the worker without detaching the original (the
- *  parent may still need `boundingBox` / `boundingSphere` on the source
- *  geometry). `BufferAttribute.array` is typed as `TypedArray` in three —
- *  the `ArrayLike<number>` constructor overload works for all variants. */
-function cloneFloat32(src: ArrayLike<number>): Float32Array {
-  return new Float32Array(src);
 }
 
 export function PointCloud({
-  geometry,
+  chunks,
   pointSize = 0.03,
-  voxelSize = 0,
   cameraMode = "3d",
   zCeiling = null,
   cropRegion = null,
   onPick,
   pickEnabled = false,
   pointsRef,
-  targetChunkPoints = DEFAULT_TARGET_CHUNK_POINTS,
-  onStatsChange,
 }: PointCloudProps) {
   // -----------------------------------------------------------------------
   // Uniforms (shared across every chunk's material). Stable object
@@ -259,214 +219,6 @@ export function PointCloud({
   ]);
 
   // -----------------------------------------------------------------------
-  // Worker lifecycle. Lives for the lifetime of the component. Re-ingests
-  // the cloud when `geometry` changes (= user loaded a new PCD);
-  // otherwise just swaps voxel params.
-  // -----------------------------------------------------------------------
-  const workerRef = useRef<Worker | null>(null);
-
-  // Chunk geometries currently mounted. Stored as plain objects so we can
-  // dispose them deterministically in cleanup; never mutated in place.
-  const [chunkGeos, setChunkGeos] = useState<
-    Array<{ key: string; geo: THREE.BufferGeometry }>
-  >([]);
-  const chunkGeosRef = useRef(chunkGeos);
-  useEffect(() => { chunkGeosRef.current = chunkGeos; }, [chunkGeos]);
-
-  // Latest onStatsChange in a ref so the worker handler doesn't need to
-  // be re-bound on every parent re-render (would cancel pending voxel
-  // debounce timers for no reason).
-  const onStatsRef = useRef(onStatsChange);
-  useEffect(() => { onStatsRef.current = onStatsChange; }, [onStatsChange]);
-
-  const emitStats = (stats: PointCloudStats) => {
-    onStatsRef.current?.(stats);
-  };
-
-  // Tracks what's been ingested; survives voxel/chunk re-runs.
-  const ingestedRef = useRef<{
-    rawPoints:   number;
-    voxelPoints: number;
-    chunkCount:  number;
-  }>({ rawPoints: 0, voxelPoints: 0, chunkCount: 0 });
-
-  // -----------------------------------------------------------------------
-  // Spawn / teardown the worker.
-  // -----------------------------------------------------------------------
-  useEffect(() => {
-    const w = new Worker(
-      new URL("./pointCloudWorker.ts", import.meta.url),
-      { type: "module" }
-    );
-    workerRef.current = w;
-
-    w.onmessage = (e: MessageEvent<OutMsg>) => {
-      const msg = e.data;
-      switch (msg.type) {
-        case "progress": {
-          const total = msg.total || 1;
-          emitStats({
-            phase:       "processing",
-            rawPoints:   ingestedRef.current.rawPoints,
-            voxelPoints: ingestedRef.current.voxelPoints,
-            chunkCount:  ingestedRef.current.chunkCount,
-            progress:    Math.min(1, msg.done / total),
-            message:     msg.phase === "voxel" ? "Voxel downsampling…" : "Chunking cloud…",
-          });
-          break;
-        }
-        case "chunks": {
-          // Tear down any previously-mounted chunk geometries.
-          for (const g of chunkGeosRef.current) g.geo.dispose();
-
-          // Build BufferGeometries for the new chunks. We own the Float32Arrays
-          // transferred from the worker, so no copy needed.
-          const next = msg.chunks.map<{ key: string; geo: THREE.BufferGeometry }>(
-            (c: ChunkOut, i: number) => {
-              const g = new THREE.BufferGeometry();
-              g.setAttribute("position", new THREE.BufferAttribute(c.positions, 3));
-              g.setAttribute("color",    new THREE.BufferAttribute(c.colors, 3));
-              // Set bbox/sphere from the worker's per-chunk min/max so
-              // frustum culling + raycast early-out work without a
-              // full-buffer scan on the main thread.
-              const min = new THREE.Vector3(...c.min);
-              const max = new THREE.Vector3(...c.max);
-              g.boundingBox    = new THREE.Box3(min, max);
-              g.boundingSphere = new THREE.Sphere();
-              g.boundingBox.getBoundingSphere(g.boundingSphere);
-              return { key: `${c.cellKey}-${i}`, geo: g };
-            }
-          );
-          setChunkGeos(next);
-
-          ingestedRef.current = {
-            rawPoints:   msg.rawPoints,
-            voxelPoints: msg.voxelPoints,
-            chunkCount:  next.length,
-          };
-
-          emitStats({
-            phase:       "ready",
-            rawPoints:   msg.rawPoints,
-            voxelPoints: msg.voxelPoints,
-            chunkCount:  next.length,
-            progress:    null,
-          });
-          break;
-        }
-        case "error": {
-          emitStats({
-            phase:       "error",
-            rawPoints:   ingestedRef.current.rawPoints,
-            voxelPoints: ingestedRef.current.voxelPoints,
-            chunkCount:  ingestedRef.current.chunkCount,
-            progress:    null,
-            message:     msg.message,
-          });
-          break;
-        }
-      }
-    };
-
-    return () => {
-      w.postMessage({ type: "clear" } as InMsg);
-      w.terminate();
-      workerRef.current = null;
-
-      // Dispose any geometries currently mounted. They own buffers we
-      // transferred from the worker — disposing releases GPU memory and
-      // lets the JS runtime free the typed arrays.
-      for (const g of chunkGeosRef.current) g.geo.dispose();
-    };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // -----------------------------------------------------------------------
-  // Ingest: whenever the source geometry changes, ship its buffers to
-  // the worker. We CLONE them first so the source keeps a usable copy
-  // (bbox/sphere calculations, future re-ingests, …).
-  // -----------------------------------------------------------------------
-  useEffect(() => {
-    const w = workerRef.current;
-    if (!w || !geometry) return;
-    const posAttr = geometry.attributes.position;
-    if (!posAttr) return;
-
-    const positions = cloneFloat32(posAttr.array as ArrayLike<number>);
-    const colAttr   = geometry.attributes.color;
-    const colors    = colAttr
-      ? cloneFloat32(colAttr.array as ArrayLike<number>)
-      : undefined;
-
-    // `.buffer` is typed as ArrayBufferLike (could be SharedArrayBuffer)
-    // but we just allocated these Float32Arrays ourselves so they're
-    // plain ArrayBuffers — safe to cast for the transferable list.
-    const transfer: ArrayBuffer[] = [positions.buffer as ArrayBuffer];
-    if (colors) transfer.push(colors.buffer as ArrayBuffer);
-
-    emitStats({
-      phase:       "processing",
-      rawPoints:   positions.length / 3,
-      voxelPoints: 0,
-      chunkCount:  0,
-      progress:    0,
-      message:     "Handing off to worker…",
-    });
-
-    const msg: InMsg = {
-      type:              "ingest",
-      positions,
-      colors,
-      voxelSize,
-      targetChunkPoints,
-    };
-    w.postMessage(msg, transfer);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [geometry]);
-
-  // -----------------------------------------------------------------------
-  // Voxel slider: debounced re-run. Uses the worker's cached raw buffers
-  // so we don't re-transfer the cloud — just (voxelSize, chunkTarget).
-  //
-  // First render after `geometry` changes still goes through the `ingest`
-  // effect above (which already carries `voxelSize`), so this guard skips
-  // the duplicate kick-off on the initial mount.
-  // -----------------------------------------------------------------------
-  const skipFirstVoxel = useRef(true);
-  useEffect(() => {
-    if (skipFirstVoxel.current) {
-      skipFirstVoxel.current = false;
-      return;
-    }
-    const w = workerRef.current;
-    if (!w) return;
-
-    const handle = window.setTimeout(() => {
-      emitStats({
-        phase:       "processing",
-        rawPoints:   ingestedRef.current.rawPoints,
-        voxelPoints: ingestedRef.current.voxelPoints,
-        chunkCount:  ingestedRef.current.chunkCount,
-        progress:    0,
-        message:     "Re-voxeling…",
-      });
-      w.postMessage({
-        type:              "voxel",
-        voxelSize,
-        targetChunkPoints,
-      } as InMsg);
-    }, VOXEL_DEBOUNCE_MS);
-
-    return () => window.clearTimeout(handle);
-  }, [voxelSize, targetChunkPoints]);
-
-  // Re-ingest should reset the "skip first voxel" flag so later voxel
-  // changes still debounce properly.
-  useEffect(() => {
-    skipFirstVoxel.current = true;
-  }, [geometry]);
-
-  // -----------------------------------------------------------------------
   // Picking — forwarded from whichever chunk the raycaster hit. R3F's
   // onClick bubbles up to the group, so one handler covers every tile.
   // -----------------------------------------------------------------------
@@ -479,7 +231,7 @@ export function PointCloud({
 
   return (
     <group ref={pointsRef} onClick={handleGroupClick}>
-      {chunkGeos.map(({ key, geo }) => (
+      {chunks.map(({ key, geo }) => (
         <points
           key={key}
           geometry={geo}
