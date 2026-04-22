@@ -30,6 +30,7 @@ import {
   resolveAll,
   getNodeOrNull,
 } from "./lanelet/registry";
+import { downloadLanelet2Osm } from "./lanelet/export";
 import type { LaneletEndSnap } from "./lanelet/registry";
 import type {
   Lanelet,
@@ -729,6 +730,20 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
     nextNodeIdRef.current    = 1;
   };
 
+  /**
+   * Export the current map as a Lanelet2 OSM file. The output filename
+   * piggybacks on the loaded PCD name when available so the exported map
+   * lives next to its source cloud ("foo.pcd" → "foo.osm"); falls back to
+   * MapToolbox's default ("lanelet2_map.osm") otherwise.
+   */
+  const exportOsm = () => {
+    const base =
+      fileName && fileName.toLowerCase().endsWith(".pcd")
+        ? fileName.slice(0, -4)
+        : fileName || "lanelet2_map";
+    downloadLanelet2Osm(registry, lanelets, `${base}.osm`);
+  };
+
   return (
     <div className="relative w-full h-full">
       <Canvas
@@ -911,6 +926,19 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
             <span className="text-white/50">Esc to cancel</span>
           </div>
         )}
+
+        <button
+          onClick={exportOsm}
+          disabled={lanelets.length === 0}
+          title="Export current map as Lanelet2 OSM"
+          className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-mono text-emerald-300 border border-emerald-400/40 bg-emerald-500/10 hover:bg-emerald-500/20 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-emerald-500/10"
+        >
+          <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round"
+              d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3" />
+          </svg>
+          Download .osm
+        </button>
 
         <button
           onClick={clearAll}
