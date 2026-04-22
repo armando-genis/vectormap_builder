@@ -1,6 +1,8 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import type { Lanelet, LaneletSubType, LaneletTurn } from "./types";
+import type { JointType } from "./geometry";
 
 interface LaneletPropertiesProps {
   lanelets: Lanelet[];        // full list
@@ -12,6 +14,8 @@ interface LaneletPropertiesProps {
   onDeselectAll: () => void;
   /** Spawn a neighbor lanelet sharing the selected lanelet's left/right edge. */
   onDuplicateNeighbor: (sourceId: number, side: "left" | "right") => void;
+  /** Create a connector lanelet from `fromId`'s end to `toId`'s start. */
+  onCreateJoint: (fromId: number, toId: number, type: JointType) => void;
 }
 
 export function LaneletProperties({
@@ -23,7 +27,22 @@ export function LaneletProperties({
   onDelete,
   onDeselectAll,
   onDuplicateNeighbor,
+  onCreateJoint,
 }: LaneletPropertiesProps) {
+  // Joint panel local state — target lanelet id and turn type.
+  // Hooks must run unconditionally, so declare them before the early
+  // return on empty selection.
+  const [jointTargetId, setJointTargetId] = useState<number | null>(null);
+  const [jointType, setJointType] = useState<JointType>("straight");
+
+  // Reset target when the selection changes to a different single lanelet
+  // (stale id from a previous selection must not leak through).
+  const singleId =
+    selectedIds.size === 1 ? Array.from(selectedIds)[0] : null;
+  useEffect(() => {
+    setJointTargetId(null);
+  }, [singleId]);
+
   if (selectedIds.size === 0) return null;
 
   const selected = lanelets.filter((l) => selectedIds.has(l.id));
@@ -175,6 +194,91 @@ export function LaneletProperties({
           </div>
         </div>
       )}
+
+      {/* ── Joint (single selection only) ────────────────── */}
+      {single && (() => {
+        const others = lanelets.filter((l) => l.id !== single.id);
+        const target = jointTargetId !== null
+          ? others.find((l) => l.id === jointTargetId) ?? null
+          : null;
+        const canCreate = target !== null;
+        return (
+          <div className="flex flex-col gap-1.5 pt-1 border-t border-white/10">
+            <div className="text-[10px] font-mono text-white/40 uppercase tracking-wider pt-2">
+              Joint
+            </div>
+
+            {/* From / To — reads like "id #{from} → id #{to}" */}
+            <div className="flex items-center gap-2 text-[11px] font-mono text-white/70">
+              <span className="text-white/40">From</span>
+              <span className="px-1.5 py-0.5 rounded bg-cyan-500/15 border border-cyan-400/30 text-cyan-200">
+                #{single.id}
+              </span>
+              <svg className="w-3 h-3 text-white/30" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M13.5 4.5 21 12m0 0-7.5 7.5M21 12H3" />
+              </svg>
+              <span className="text-white/40">To</span>
+              <select
+                value={jointTargetId ?? ""}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setJointTargetId(v === "" ? null : parseInt(v, 10));
+                }}
+                className="flex-1 bg-white/5 border border-white/10 rounded-md px-2 py-1 text-xs font-mono text-white/80 focus:outline-none focus:border-cyan-400/50 cursor-pointer"
+                disabled={others.length === 0}
+              >
+                <option value="">
+                  {others.length === 0 ? "— no others —" : "(select…)"}
+                </option>
+                {others.map((l) => (
+                  <option key={l.id} value={l.id}>
+                    #{l.id}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Type — straight / left / right */}
+            <FieldRow label="Shape">
+              <div className="flex w-full rounded-md overflow-hidden border border-white/10">
+                {(["straight", "left", "right"] as JointType[]).map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => setJointType(t)}
+                    className={
+                      "flex-1 px-2 py-1 text-[11px] font-mono transition-colors cursor-pointer " +
+                      (jointType === t
+                        ? "bg-cyan-500/30 text-cyan-100"
+                        : "bg-white/5 text-white/60 hover:bg-white/10")
+                    }
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+            </FieldRow>
+
+            <button
+              onClick={() => {
+                if (target) onCreateJoint(single.id, target.id, jointType);
+              }}
+              disabled={!canCreate}
+              className="flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono border transition-colors cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent border-emerald-400/30 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-200 hover:text-emerald-100"
+              title="Create a connector lanelet from this end to the target start"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M12 4v16m8-8H4" />
+              </svg>
+              Create joint
+            </button>
+            <div className="text-[9px] font-mono text-white/30 leading-3 pt-0.5">
+              Connector joins #{single.id} end → #{target?.id ?? "?"} start
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ── Actions ───────────────────────────────────────── */}
       <div className="flex gap-2 pt-1">

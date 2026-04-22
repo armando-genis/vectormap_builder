@@ -100,8 +100,19 @@ export interface CreateLaneletParams {
    * centerline between start and end. Interior nodes are what let the user
    * bend the lanelet into curves afterwards. 0 = straight lanelet with
    * only two nodes per boundary; 2 = MapToolbox-style default.
+   *
+   * Ignored when `interiorCenters` is set.
    */
   interiorCount?: number;
+  /**
+   * Explicit interior centerline waypoints, in order from start toward
+   * end (NOT including the endpoints themselves). When supplied, the
+   * lanelet's boundary polylines have `2 + interiorCenters.length` pairs
+   * and each interior pair is placed perpendicular to the local spine
+   * tangent at the given waypoint. Use this to build connector lanelets
+   * (e.g. `joinLanelets`) with a specific turn shape.
+   */
+  interiorCenters?: Vec3[];
 }
 
 /**
@@ -129,6 +140,7 @@ export function createLanelet(
     startOverride,
     endOverride,
     interiorCount = 2,
+    interiorCenters,
   } = params;
 
   // Axis: when an end is overridden we snap the relevant endpoint to the
@@ -136,18 +148,34 @@ export function createLanelet(
   const cs: Vec3 = startOverride ? startOverride.center : centerStart;
   const ce: Vec3 = endOverride   ? endOverride.center   : centerEnd;
 
-  const [lx, lz] = leftPerpXZ(cs, ce);
   const half = width / 2;
 
-  // Total boundary length: 2 endpoints + N interior.
-  const n = 2 + Math.max(0, interiorCount);
+  // Centerline control points for the new lanelet — starts at `cs`, ends
+  // at `ce`, with interior waypoints either supplied explicitly (connector
+  // lanelets) or auto-spaced along the straight `cs → ce` line.
+  const centers: Vec3[] = interiorCenters
+    ? [cs, ...interiorCenters, ce]
+    : (() => {
+        const n = 2 + Math.max(0, interiorCount);
+        const arr: Vec3[] = new Array(n);
+        for (let i = 0; i < n; i++) {
+          const t = n === 1 ? 0 : i / (n - 1);
+          arr[i] = lerp(cs, ce, t);
+        }
+        return arr;
+      })();
+  const n = centers.length;
 
-  // Compute raw (unsnapped, unoverridden) positions for every index.
+  // Per-index boundary positions. The local left-perpendicular at index i
+  // comes from the prev→next centerline tangent so curved connectors get
+  // a cross-section that follows the spine (no twist on bends).
   const leftRaw:  Vec3[] = new Array(n);
   const rightRaw: Vec3[] = new Array(n);
   for (let i = 0; i < n; i++) {
-    const t = n === 1 ? 0 : i / (n - 1);
-    const c = lerp(cs, ce, t);
+    const prev = centers[Math.max(0, i - 1)];
+    const next = centers[Math.min(n - 1, i + 1)];
+    const [lx, lz] = leftPerpXZ(prev, next);
+    const c = centers[i];
     leftRaw[i]  = [c[0] + lx * half, c[1], c[2] + lz * half];
     rightRaw[i] = [c[0] - lx * half, c[1], c[2] - lz * half];
   }
@@ -370,6 +398,230 @@ export function resizeLaneletWidth(
     reg: moveNodes(reg, updates),
     lanelet: { ...lanelet, width: newWidth },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Connector lanelets — "join" A's end to B's start
+// ---------------------------------------------------------------------------
+
+export type JointType = "straight" | "left" | "right";
+
+export interface JoinLaneletsParams {
+  reg: NodeRegistry;
+  nextNodeId: { current: number };
+  laneletId: number;
+  /** Connector starts at `from`'s end (last boundary pair). */
+  from: Lanelet;
+  /** Connector ends at `to`'s start (first boundary pair). */
+  to: Lanelet;
+  /** Turn shape for the connector's interior waypoints. */
+  type: JointType;
+  /** Width for interior nodes. Defaults to the mean of from/to widths. */
+  width?: number;
+  snapY?: (x: number, z: number, fallbackY: number) => number;
+}
+
+/**
+ * Build a connector lanelet running from the END of `from` to the START
+ * of `to`. The two ends of the connector adopt the existing corner
+ * NodeIds of `from`/`to` as a pair — same pair-attach mechanic as
+ * two-click creation — so the three lanelets are structurally joined.
+ *
+ * The shape is determined by the type AND by the actual tangent
+ * directions at `from`'s end and `to`'s start. A `left`/`right`
+ * connector leaves `from` along its forward heading and arrives at
+ * `to` along `to`'s forward heading — producing a natural L-turn like
+ * a road intersection connector, not a perpendicular bulge off the
+ * chord. `straight` ignores tangents and draws a direct ribbon.
+ *
+ * `type` is also stored on the new lanelet as `turnDirection`, so the
+ * metadata matches the shape when exporting to Lanelet2 OSM.
+ */
+export function joinLanelets(
+  params: JoinLaneletsParams
+): { reg: NodeRegistry; lanelet: Lanelet } {
+  const { reg, nextNodeId, laneletId, from, to, type, snapY } = params;
+
+  // Pair-attach snap for FROM's end.
+  const fLast = from.leftBoundary.length - 1;
+  const fLeftId  = from.leftBoundary[fLast];
+  const fRightId = from.rightBoundary[fLast];
+  const fLeftP   = getNode(reg, fLeftId);
+  const fRightP  = getNode(reg, fRightId);
+  const csCenter: Vec3 = midpoint(fLeftP, fRightP);
+  const startOverride: LaneletEndSnap = {
+    laneletId: from.id,
+    end: "end",
+    center: csCenter,
+    leftId: fLeftId,
+    rightId: fRightId,
+    leftPos: fLeftP,
+    rightPos: fRightP,
+  };
+
+  // Pair-attach snap for TO's start.
+  const tLeftId  = to.leftBoundary[0];
+  const tRightId = to.rightBoundary[0];
+  const tLeftP   = getNode(reg, tLeftId);
+  const tRightP  = getNode(reg, tRightId);
+  const ceCenter: Vec3 = midpoint(tLeftP, tRightP);
+  const endOverride: LaneletEndSnap = {
+    laneletId: to.id,
+    end: "start",
+    center: ceCenter,
+    leftId: tLeftId,
+    rightId: tRightId,
+    leftPos: tLeftP,
+    rightPos: tRightP,
+  };
+
+  // Tangent directions:
+  //   dirA = forward direction at A's end (last centerline segment of A)
+  //   dirB = forward direction entering B (first centerline segment of B)
+  const dirA = lastSegmentTangentXZ(reg, from);
+  const dirB = firstSegmentTangentXZ(reg, to);
+
+  const interior = connectorInteriorCenters(
+    csCenter, ceCenter, type, dirA, dirB
+  );
+
+  const width =
+    params.width !== undefined ? params.width : (from.width + to.width) / 2;
+
+  const { reg: regAfter, lanelet } = createLanelet({
+    reg,
+    nextNodeId,
+    laneletId,
+    centerStart: csCenter,
+    centerEnd:   ceCenter,
+    width,
+    snapY,
+    attachDistance: ATTACH_DISTANCE,
+    startOverride,
+    endOverride,
+    interiorCenters: interior,
+  });
+
+  // Persist the user's shape choice as Lanelet2 turn metadata.
+  const turnDirection: Lanelet["turnDirection"] =
+    type === "straight" ? "straight" :
+    type === "left"     ? "left"     :
+    "right";
+
+  return {
+    reg: regAfter,
+    lanelet: { ...lanelet, turnDirection },
+  };
+}
+
+// Unit vector along A's last centerline segment (forward exit direction).
+// Returns [0,0] if the lanelet is degenerate.
+function lastSegmentTangentXZ(
+  reg: NodeRegistry,
+  l: Lanelet
+): [number, number] {
+  const n = l.leftBoundary.length;
+  if (n < 2) return [0, 0];
+  const aL = getNode(reg, l.leftBoundary[n - 2]);
+  const aR = getNode(reg, l.rightBoundary[n - 2]);
+  const bL = getNode(reg, l.leftBoundary[n - 1]);
+  const bR = getNode(reg, l.rightBoundary[n - 1]);
+  const dx = (bL[0] + bR[0]) * 0.5 - (aL[0] + aR[0]) * 0.5;
+  const dz = (bL[2] + bR[2]) * 0.5 - (aL[2] + aR[2]) * 0.5;
+  const d  = Math.hypot(dx, dz);
+  return d < 1e-6 ? [0, 0] : [dx / d, dz / d];
+}
+
+// Unit vector along B's first centerline segment (forward entry direction).
+function firstSegmentTangentXZ(
+  reg: NodeRegistry,
+  l: Lanelet
+): [number, number] {
+  if (l.leftBoundary.length < 2) return [0, 0];
+  const aL = getNode(reg, l.leftBoundary[0]);
+  const aR = getNode(reg, l.rightBoundary[0]);
+  const bL = getNode(reg, l.leftBoundary[1]);
+  const bR = getNode(reg, l.rightBoundary[1]);
+  const dx = (bL[0] + bR[0]) * 0.5 - (aL[0] + aR[0]) * 0.5;
+  const dz = (bL[2] + bR[2]) * 0.5 - (aL[2] + aR[2]) * 0.5;
+  const d  = Math.hypot(dx, dz);
+  return d < 1e-6 ? [0, 0] : [dx / d, dz / d];
+}
+
+// Evaluate a cubic Bezier curve at parameter t.
+function cubicBezier(
+  t: number, p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3
+): Vec3 {
+  const u   = 1 - t;
+  const uu  = u * u;
+  const uuu = uu * u;
+  const tt  = t * t;
+  const ttt = tt * t;
+  return [
+    uuu * p0[0] + 3 * uu * t * p1[0] + 3 * u * tt * p2[0] + ttt * p3[0],
+    uuu * p0[1] + 3 * uu * t * p1[1] + 3 * u * tt * p2[1] + ttt * p3[1],
+    uuu * p0[2] + 3 * uu * t * p1[2] + 3 * u * tt * p2[2] + ttt * p3[2],
+  ];
+}
+
+/**
+ * Interior centerline waypoints for a connector.
+ *
+ * For `left`/`right`: we build a cubic Bezier whose control handles
+ * extend from cs along dirA and from ce back along dirB (classic
+ * "tangent-matching" Bezier). Sampling it at t = 1/4, 2/4, 3/4 gives 3
+ * interior waypoints; combined with the endpoints that's 5 control
+ * nodes per boundary — enough for the render-time Catmull-Rom spline
+ * to produce a visually smooth arc that leaves A along A's heading and
+ * enters B along B's heading.
+ *
+ * For `straight`: ignore tangents, lay 3 interior points on the direct
+ * line so a straight connector stays perfectly straight even when A
+ * and B aren't collinear.
+ *
+ * If either tangent degenerates (e.g. a 2-node lanelet with zero-length
+ * last segment after surface snap), fall back to the direct A→B
+ * direction for that side so the curve stays well-formed.
+ */
+function connectorInteriorCenters(
+  cs: Vec3,
+  ce: Vec3,
+  type: JointType,
+  dirA: [number, number],
+  dirB: [number, number]
+): Vec3[] {
+  const straightInterior: Vec3[] = [
+    lerp(cs, ce, 1 / 4),
+    lerp(cs, ce, 2 / 4),
+    lerp(cs, ce, 3 / 4),
+  ];
+  if (type === "straight") return straightInterior;
+
+  const dx = ce[0] - cs[0];
+  const dz = ce[2] - cs[2];
+  const d  = Math.hypot(dx, dz);
+  if (d < 1e-6) return straightInterior;
+
+  const hasA = dirA[0] !== 0 || dirA[1] !== 0;
+  const hasB = dirB[0] !== 0 || dirB[1] !== 0;
+  const fallback: [number, number] = [dx / d, dz / d];
+  const dA: [number, number] = hasA ? dirA : fallback;
+  const dB: [number, number] = hasB ? dirB : fallback;
+
+  // Bezier handle length — 45% of the gap gives a curvature that looks
+  // like a road corner, not too wide, not too tight.
+  const h = d * 0.45;
+
+  const b1: Vec3 = [cs[0] + dA[0] * h, cs[1], cs[2] + dA[1] * h];
+  const b2: Vec3 = [ce[0] - dB[0] * h, ce[1], ce[2] - dB[1] * h];
+
+  // 3 interior samples from the Bezier. Catmull-Rom at render time will
+  // pass through all of them and fair out the curve further.
+  return [
+    cubicBezier(0.25, cs, b1, b2, ce),
+    cubicBezier(0.50, cs, b1, b2, ce),
+    cubicBezier(0.75, cs, b1, b2, ce),
+  ];
 }
 
 // ---------------------------------------------------------------------------

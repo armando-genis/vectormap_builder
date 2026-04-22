@@ -13,6 +13,7 @@ import {
   createLanelet,
   duplicateLaneletLeft,
   duplicateLaneletRight,
+  joinLanelets,
   moveLaneletNodeAtIndex,
   resizeLaneletWidth,
   reverseLanelet,
@@ -20,6 +21,7 @@ import {
   snapLaneletToSurface,
   ATTACH_DISTANCE,
 } from "./lanelet/geometry";
+import type { JointType } from "./lanelet/geometry";
 import {
   createRegistry,
   findNearestLaneletEnd,
@@ -630,6 +632,39 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
     setSelectedIds(new Set([newId]));
   };
 
+  // Build a "connector" lanelet from `fromId`'s end to `toId`'s start. The
+  // two end pairs of the connector adopt the existing corner NodeIds via
+  // pair-attach, so A, connector and B become one connected chain with
+  // shared junction NodeIds at both seams.
+  //
+  // We don't surface-snap interior Y at creation time: the endpoints
+  // inherit their (already-snapped) Y from the existing lanelets, and the
+  // interior waypoints average those Ys — close enough to the ground for
+  // a first draft. Dragging any interior handle afterwards re-runs
+  // `snapLaneletToSurface` on pointer-up.
+  const createJoint = (fromId: number, toId: number, type: JointType) => {
+    if (fromId === toId) return;
+    const from = lanelets.find((l) => l.id === fromId);
+    const to   = lanelets.find((l) => l.id === toId);
+    if (!from || !to) return;
+
+    const width = (from.width + to.width) / 2;
+
+    const { reg, lanelet } = joinLanelets({
+      reg: registry,
+      nextNodeId: nextNodeIdRef,
+      laneletId: nextLaneletIdRef.current++,
+      from,
+      to,
+      type,
+      width,
+    });
+
+    setRegistry(reg);
+    setLanelets((ls) => [...ls, lanelet]);
+    setSelectedIds(new Set([lanelet.id]));
+  };
+
   // Keyboard shortcuts
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -781,6 +816,7 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
         onDelete={deleteIds}
         onDeselectAll={deselectAll}
         onDuplicateNeighbor={duplicateNeighbor}
+        onCreateJoint={createJoint}
       />
 
       {/* ── Tool panel ──────────────────────────────────────── */}
