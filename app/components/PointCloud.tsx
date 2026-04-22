@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo } from "react";
+import type { RefObject } from "react";
 import * as THREE from "three";
 
 interface PointCloudProps {
@@ -20,6 +21,8 @@ interface PointCloudProps {
    */
   onPick?: (pos: [number, number, number]) => void;
   pickEnabled?: boolean;
+  /** Gives the parent access to the <points> object for extra raycasts. */
+  pointsRef?: RefObject<THREE.Points | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +140,7 @@ export function PointCloud({
   zCeiling = null,
   onPick,
   pickEnabled = false,
+  pointsRef,
 }: PointCloudProps) {
   const renderGeo = useMemo(() => {
     const downsampled =
@@ -188,6 +192,7 @@ export function PointCloud({
 
   return (
     <points
+      ref={pointsRef}
       geometry={renderGeo}
       onClick={
         pickEnabled && onPick

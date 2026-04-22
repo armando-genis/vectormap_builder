@@ -1,14 +1,41 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls, Grid, Stats } from "@react-three/drei";
 import * as THREE from "three";
 import { PointCloud } from "./PointCloud";
-import { PointMarkers, type Marker } from "./PointMarkers";
+import { LaneletLayer } from "./lanelet/LaneletLayer";
+import { LaneletProperties } from "./lanelet/LaneletProperties";
+import {
+  createLanelet,
+  duplicateLaneletLeft,
+  duplicateLaneletRight,
+  moveLaneletEndpoint,
+  resizeLaneletWidth,
+  reverseLanelet,
+  sampleSurfaceY,
+  snapLaneletToSurface,
+  ATTACH_DISTANCE,
+} from "./lanelet/geometry";
+import {
+  createRegistry,
+  findNearestLaneletEnd,
+  gcUnused,
+  junctionNodeIds,
+  resolveAll,
+  getNodeOrNull,
+} from "./lanelet/registry";
+import type { LaneletEndSnap } from "./lanelet/registry";
+import type {
+  Lanelet,
+  NodeRegistry,
+  ResolvedLanelet,
+  Vec3,
+} from "./lanelet/types";
 
 type CameraMode = "3d" | "2d";
-type Tool       = "view" | "place";
+type Tool       = "view" | "lanelet";
 
 interface SceneProps {
   geometry: THREE.BufferGeometry | null;
@@ -17,8 +44,28 @@ interface SceneProps {
   zCeiling: number;
   cameraMode: CameraMode;
   tool: Tool;
-  markers: Marker[];
-  onPick: (pos: Marker) => void;
+  width: number;
+
+  registry: NodeRegistry;
+  nextNodeIdRef: React.MutableRefObject<number>;
+
+  lanelets: Lanelet[];
+  resolvedLanelets: ResolvedLanelet[];
+  junctionPositions: Vec3[];
+
+  selectedIds: Set<number>;
+  onSelect: (id: number, shiftKey: boolean) => void;
+  pendingStart: Vec3 | null;
+  /** Set iff the pending start attached to an existing lanelet's end. */
+  pendingStartSnap: LaneletEndSnap | null;
+  onStartLanelet: (p: Vec3, snap: LaneletEndSnap | null) => void;
+  onFinishLanelet: (reg: NodeRegistry, l: Lanelet) => void;
+
+  /** Called after every in-place edit (drag, surface-snap). Updates both
+   *  registry and the single lanelet atomically. */
+  onUpsertLanelet: (reg: NodeRegistry, l: Lanelet) => void;
+
+  nextLaneletIdRef: React.MutableRefObject<number>;
 }
 
 function Scene({
@@ -28,14 +75,40 @@ function Scene({
   zCeiling,
   cameraMode,
   tool,
-  markers,
-  onPick,
+  width,
+  registry,
+  nextNodeIdRef,
+  lanelets,
+  resolvedLanelets,
+  junctionPositions,
+  selectedIds,
+  onSelect,
+  pendingStart,
+  pendingStartSnap,
+  onStartLanelet,
+  onFinishLanelet,
+  onUpsertLanelet,
+  nextLaneletIdRef,
 }: SceneProps) {
-  const { camera, raycaster } = useThree();
+  const { camera, raycaster, gl } = useThree();
   const controlsRef = useRef<any>(null);
+  const pointsRef   = useRef<THREE.Points | null>(null);
 
-  // Tune the points raycast so clicks reliably hit a nearby cloud point.
-  // Threshold is in world units; scale it with the scene so big maps still pick.
+  // Always-current reads inside long-running drag handlers.
+  const laneletsRef = useRef(lanelets);
+  const registryRef = useRef(registry);
+  const onUpsertRef = useRef(onUpsertLanelet);
+  useEffect(() => { laneletsRef.current = lanelets;   }, [lanelets]);
+  useEffect(() => { registryRef.current = registry;   }, [registry]);
+  useEffect(() => { onUpsertRef.current = onUpsertLanelet; }, [onUpsertLanelet]);
+
+  const [dragHandle, setDragHandle] = useState<
+    { id: number; which: "start" | "end" } | null
+  >(null);
+
+  const surfaceRc = useMemo(() => new THREE.Raycaster(), []);
+
+  // Tune pick raycaster threshold to scene scale.
   useEffect(() => {
     const r = geometry?.boundingSphere?.radius ?? 50;
     raycaster.params.Points = {
@@ -74,6 +147,184 @@ function Scene({
       controlsRef.current.update();
     }
   }, [geometry, cameraMode, camera]);
+
+  // --------------------------------------------------------------------
+  // Drag handles — translate the centerStart/centerEnd of a lanelet. The
+  // two boundary nodes at that end move by the same delta. Because those
+  // NodeIds are shared with any connected neighbor, the whole junction
+  // follows coherently (no extra bookkeeping).
+  // --------------------------------------------------------------------
+  const handleHandlePointerDown = (id: number, which: "start" | "end") => {
+    if (controlsRef.current) controlsRef.current.enabled = false;
+    setDragHandle({ id, which });
+  };
+
+  useEffect(() => {
+    if (!dragHandle) return;
+
+    const controls = controlsRef.current;
+    if (controls) controls.enabled = false;
+
+    const prevCursor = document.body.style.cursor;
+    document.body.style.cursor = "grabbing";
+
+    const initial = laneletsRef.current.find((l) => l.id === dragHandle.id);
+    if (!initial) {
+      if (controls) controls.enabled = true;
+      document.body.style.cursor = prevCursor;
+      setDragHandle(null);
+      return;
+    }
+
+    // Drag plane Y = current midpoint Y of the two boundary nodes at this
+    // end. Derived here (not read off the lanelet) because the centerline
+    // is no longer stored — it's always computed from the registry.
+    const reg0    = registryRef.current;
+    const leftId  = dragHandle.which === "start"
+      ? initial.leftBoundary[0]  : initial.leftBoundary[1];
+    const rightId = dragHandle.which === "start"
+      ? initial.rightBoundary[0] : initial.rightBoundary[1];
+    const leftP  = reg0.nodes[leftId];
+    const rightP = reg0.nodes[rightId];
+    const planeY = leftP && rightP ? (leftP[1] + rightP[1]) * 0.5 : 0;
+
+    const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -planeY);
+    const dragRc = new THREE.Raycaster();
+    const ndc = new THREE.Vector2();
+    const hit = new THREE.Vector3();
+
+    const mouseToPlane = (clientX: number, clientY: number): Vec3 | null => {
+      const rect = gl.domElement.getBoundingClientRect();
+      ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+      ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+      dragRc.setFromCamera(ndc, camera);
+      const p = dragRc.ray.intersectPlane(plane, hit);
+      if (!p) return null;
+      return [p.x, planeY, p.z];
+    };
+
+    const onMove = (e: PointerEvent) => {
+      document.body.style.cursor = "grabbing";
+
+      const np = mouseToPlane(e.clientX, e.clientY);
+      if (!np) return;
+
+      const curr = laneletsRef.current.find((l) => l.id === dragHandle.id);
+      if (!curr) return;
+
+      const { reg, lanelet } = moveLaneletEndpoint(
+        registryRef.current,
+        curr,
+        dragHandle.which,
+        np
+      );
+      onUpsertRef.current(reg, lanelet);
+    };
+
+    const onUp = () => {
+      const bbox = geometry?.boundingBox;
+      const topY = (bbox?.max.y ?? 1e4) + 10;
+
+      const curr = laneletsRef.current.find((l) => l.id === dragHandle.id);
+      if (curr) {
+        surfaceRc.params.Points = {
+          ...(surfaceRc.params.Points ?? {}),
+          threshold: Math.max(0.1, Math.min(curr.width / 6, 0.8)),
+        };
+        const snapY = (x: number, z: number, fb: number) =>
+          sampleSurfaceY(surfaceRc, pointsRef.current, x, z, topY, fb);
+
+        const { reg, lanelet } = snapLaneletToSurface(
+          registryRef.current,
+          curr,
+          snapY
+        );
+        onUpsertRef.current(reg, lanelet);
+      }
+
+      if (controls) controls.enabled = true;
+      document.body.style.cursor = prevCursor;
+      setDragHandle(null);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (controls) controls.enabled = true;
+      document.body.style.cursor = prevCursor;
+    };
+  }, [dragHandle, camera, gl, surfaceRc, geometry]);
+
+  // --------------------------------------------------------------------
+  // Two-click create flow.
+  //
+  // Each click runs a pair-attach check first (findNearestLaneletEnd): if
+  // the click lands near the centerpoint of an existing lanelet's end, the
+  // new lanelet adopts that end's two NodeIds as a unit — guaranteeing a
+  // full-width connection instead of a kink where only one corner reaches.
+  //
+  // If pair-attach doesn't fire, createLanelet falls back to per-corner
+  // attach with ATTACH_DISTANCE, then surface-snaps any free corners.
+  // --------------------------------------------------------------------
+
+  /**
+   * Threshold for pair-attach: generous enough that a click that's clearly
+   * "aiming at" an existing endpoint snaps, tight enough not to merge two
+   * lanelets the user meant to keep separate. Scales with current width so
+   * wide lanelets have proportionally larger grab radius.
+   */
+  const endSnapThreshold = Math.max(ATTACH_DISTANCE, width * 0.75);
+
+  const handlePick = (p: Vec3) => {
+    if (!pendingStart) {
+      const snap = findNearestLaneletEnd(
+        registryRef.current,
+        laneletsRef.current,
+        p,
+        endSnapThreshold
+      );
+      // When snapping, use the existing lanelet's centerpoint as the start
+      // so the centerline is truly axis-aligned with the adopted corners.
+      onStartLanelet(snap ? snap.center : p, snap);
+      return;
+    }
+
+    const endSnap = findNearestLaneletEnd(
+      registryRef.current,
+      laneletsRef.current,
+      p,
+      endSnapThreshold
+    );
+
+    const bbox = geometry?.boundingBox;
+    const topY = (bbox?.max.y ?? 1e4) + 10;
+
+    surfaceRc.params.Points = {
+      ...(surfaceRc.params.Points ?? {}),
+      threshold: Math.max(0.1, Math.min(width / 6, 0.8)),
+    };
+
+    const snapY = (x: number, z: number, fallback: number) =>
+      sampleSurfaceY(surfaceRc, pointsRef.current, x, z, topY, fallback);
+
+    const { reg, lanelet } = createLanelet({
+      reg: registryRef.current,
+      nextNodeId: nextNodeIdRef,
+      laneletId: nextLaneletIdRef.current++,
+      centerStart: pendingStart,
+      centerEnd: endSnap ? endSnap.center : p,
+      width,
+      snapY,
+      attachDistance: ATTACH_DISTANCE,
+      startOverride: pendingStartSnap ?? undefined,
+      endOverride:   endSnap ?? undefined,
+    });
+
+    onFinishLanelet(reg, lanelet);
+  };
 
   const r        = geometry?.boundingSphere?.radius ?? 50;
   const gridY    = geometry?.boundingBox ? geometry.boundingBox.min.y - 0.01 : 0;
@@ -123,12 +374,25 @@ function Scene({
           voxelSize={voxelSize}
           cameraMode={cameraMode}
           zCeiling={zCeiling}
-          pickEnabled={tool === "place"}
-          onPick={onPick}
+          pickEnabled={tool === "lanelet"}
+          onPick={handlePick}
+          pointsRef={pointsRef}
         />
       )}
 
-      <PointMarkers markers={markers} />
+      <LaneletLayer
+        lanelets={resolvedLanelets}
+        selectedIds={selectedIds}
+        selectable={tool === "view"}
+        onSelect={onSelect}
+        editable={tool === "view"}
+        onHandlePointerDown={handleHandlePointerDown}
+        activeDragHandle={dragHandle}
+        pendingStart={pendingStart}
+        pendingStartAttached={pendingStartSnap !== null}
+        sceneRadius={r}
+        junctionPositions={junctionPositions}
+      />
     </>
   );
 }
@@ -141,17 +405,28 @@ interface SceneViewerProps {
 }
 
 export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneViewerProps) {
-  const [cameraMode,  setCameraMode]  = useState<CameraMode>("3d");
-  const [pointSize3d, setPointSize3d] = useState(0.03);
-  const [pointSize2d, setPointSize2d] = useState(2);
-  const [voxelSize,   setVoxelSize]   = useState(0);
-  const [showStats,   setShowStats]   = useState(false);
-  const [tool,        setTool]        = useState<Tool>("view");
-  const [markers,     setMarkers]     = useState<Marker[]>([]);
+  const [cameraMode,    setCameraMode]    = useState<CameraMode>("3d");
+  const [pointSize3d,   setPointSize3d]   = useState(0.03);
+  const [pointSize2d,   setPointSize2d]   = useState(2);
+  const [voxelSize,     setVoxelSize]     = useState(0);
+  const [showStats,     setShowStats]     = useState(false);
+  const [tool,          setTool]          = useState<Tool>("view");
+  const [width,         setWidth]         = useState(2);
+
+  const [lanelets,     setLanelets]     = useState<Lanelet[]>([]);
+  const [registry,     setRegistry]     = useState<NodeRegistry>(createRegistry());
+  const [pendingStart, setPendingStart] = useState<Vec3 | null>(null);
+  /** Remembered between click-1 and click-2 so the first click's pair-attach
+   *  flows into createLanelet even though creation only happens on click-2. */
+  const [pendingStartSnap, setPendingStartSnap] =
+    useState<LaneletEndSnap | null>(null);
+  const [selectedIds,  setSelectedIds]  = useState<Set<number>>(new Set());
+
+  const nextLaneletIdRef = useRef(1);
+  const nextNodeIdRef    = useRef(1);
 
   const pointSize = cameraMode === "3d" ? pointSize3d : pointSize2d;
 
-  // Z-clip (height ceiling)
   const bbox  = geometry?.boundingBox ?? null;
   const yMin  = bbox ? bbox.min.y : 0;
   const yMax  = bbox ? bbox.max.y : 1;
@@ -159,17 +434,187 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
   const yStep = ySpan / 200;
   const [zCeiling, setZCeiling] = useState<number>(yMax);
 
-  // Whenever the cloud changes: reset markers and show-all Z-clip.
+  // Reset on new geometry
   useEffect(() => {
     if (geometry?.boundingBox) {
       setZCeiling(geometry.boundingBox.max.y);
     }
-    setMarkers([]);
+    setLanelets([]);
+    setRegistry(createRegistry());
+    setPendingStart(null);
+    setPendingStartSnap(null);
+    setSelectedIds(new Set());
     setTool("view");
+    nextLaneletIdRef.current = 1;
+    nextNodeIdRef.current    = 1;
   }, [geometry]);
 
-  const handlePick = (pos: Marker) => {
-    setMarkers((m) => [...m, pos]);
+  useEffect(() => {
+    if (tool === "lanelet") setSelectedIds(new Set());
+  }, [tool]);
+
+  // --------------------------------------------------------------------
+  // Derived: resolved lanelets + junction markers
+  // --------------------------------------------------------------------
+  const resolvedLanelets = useMemo(
+    () => resolveAll(registry, lanelets),
+    [registry, lanelets]
+  );
+
+  const junctionPositions = useMemo<Vec3[]>(() => {
+    const ids = junctionNodeIds(lanelets);
+    const out: Vec3[] = [];
+    for (const id of ids) {
+      const p = getNodeOrNull(registry, id);
+      if (p) out.push(p);
+    }
+    return out;
+  }, [registry, lanelets]);
+
+  // --------------------------------------------------------------------
+  // Mutations
+  // --------------------------------------------------------------------
+  const deselectAll = () => setSelectedIds(new Set());
+
+  const handleSelect = (id: number, shiftKey: boolean) => {
+    setSelectedIds((prev) => {
+      if (shiftKey) {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      }
+      return new Set([id]);
+    });
+  };
+
+  const handleFinishLanelet = (reg: NodeRegistry, l: Lanelet) => {
+    setRegistry(reg);
+    setLanelets((ls) => [...ls, l]);
+    setPendingStart(null);
+    setPendingStartSnap(null);
+  };
+
+  /** Replace a single lanelet AND swap in the new registry atomically. */
+  const handleUpsertLanelet = (reg: NodeRegistry, l: Lanelet) => {
+    setRegistry(reg);
+    setLanelets((ls) => ls.map((x) => (x.id === l.id ? l : x)));
+  };
+
+  const deleteIds = (ids: number[]) => {
+    const idSet = new Set(ids);
+    setLanelets((ls) => {
+      const remaining = ls.filter((l) => !idSet.has(l.id));
+      // GC orphaned nodes from the registry. Uses the CURRENT registry
+      // snapshot — fine for sync user actions.
+      setRegistry((reg) => gcUnused(reg, remaining));
+      return remaining;
+    });
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) next.delete(id);
+      return next;
+    });
+  };
+
+  const updateIds = (ids: number[], patch: Partial<Lanelet>) => {
+    const idSet = new Set(ids);
+    setLanelets((ls) =>
+      ls.map((l) => (idSet.has(l.id) ? { ...l, ...patch } : l))
+    );
+  };
+
+  const resizeWidthIds = (ids: number[], newWidth: number) => {
+    const idSet = new Set(ids);
+    let nextReg = registry;
+    const nextLanelets = lanelets.map((l) => {
+      if (!idSet.has(l.id)) return l;
+      const { reg, lanelet } = resizeLaneletWidth(
+        nextReg,
+        nextNodeIdRef,
+        l,
+        newWidth
+      );
+      nextReg = reg;
+      return lanelet;
+    });
+    setRegistry(gcUnused(nextReg, nextLanelets));
+    setLanelets(nextLanelets);
+  };
+
+  const reverseIds = (ids: number[]) => {
+    const idSet = new Set(ids);
+    setLanelets((ls) =>
+      ls.map((l) => (idSet.has(l.id) ? reverseLanelet(l) : l))
+    );
+  };
+
+  const duplicateNeighbor = (sourceId: number, side: "left" | "right") => {
+    const src = lanelets.find((l) => l.id === sourceId);
+    if (!src) return;
+
+    const { reg: newReg, updatedSource, neighbor } =
+      side === "left"
+        ? duplicateLaneletLeft(registry, nextNodeIdRef, src)
+        : duplicateLaneletRight(registry, nextNodeIdRef, src);
+
+    const newId = nextLaneletIdRef.current++;
+    const newLanelet: Lanelet = { ...neighbor, id: newId };
+
+    setRegistry(newReg);
+    setLanelets((ls) =>
+      ls.map((l) => (l.id === sourceId ? updatedSource : l)).concat(newLanelet)
+    );
+    setSelectedIds(new Set([newId]));
+  };
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+
+      if (e.key === "Escape") {
+        if (pendingStart) {
+          setPendingStart(null);
+          setPendingStartSnap(null);
+        }
+        else if (selectedIds.size > 0) deselectAll();
+      } else if (e.key === "Delete" || e.key === "Backspace") {
+        if (selectedIds.size > 0) {
+          e.preventDefault();
+          deleteIds(Array.from(selectedIds));
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingStart, selectedIds]);
+
+  const toggleTool = () => {
+    if (tool === "lanelet") {
+      setTool("view");
+      setPendingStart(null);
+      setPendingStartSnap(null);
+    } else {
+      setTool("lanelet");
+    }
+  };
+
+  const handleStartLanelet = (p: Vec3, snap: LaneletEndSnap | null) => {
+    setPendingStart(p);
+    setPendingStartSnap(snap);
+  };
+
+  const clearAll = () => {
+    setLanelets([]);
+    setRegistry(createRegistry());
+    setPendingStart(null);
+    setPendingStartSnap(null);
+    setSelectedIds(new Set());
+    nextLaneletIdRef.current = 1;
+    nextNodeIdRef.current    = 1;
   };
 
   return (
@@ -178,6 +623,9 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
         camera={{ fov: 60, near: 0.01, far: 100000, position: [50, 30, 50] }}
         gl={{ antialias: true, alpha: false }}
         dpr={[1, 1.5]}
+        onPointerMissed={() => {
+          if (tool === "view" && selectedIds.size > 0) deselectAll();
+        }}
       >
         <Scene
           geometry={geometry}
@@ -186,8 +634,20 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
           zCeiling={zCeiling}
           cameraMode={cameraMode}
           tool={tool}
-          markers={markers}
-          onPick={handlePick}
+          width={width}
+          registry={registry}
+          nextNodeIdRef={nextNodeIdRef}
+          lanelets={lanelets}
+          resolvedLanelets={resolvedLanelets}
+          junctionPositions={junctionPositions}
+          selectedIds={selectedIds}
+          onSelect={handleSelect}
+          pendingStart={pendingStart}
+          pendingStartSnap={pendingStartSnap}
+          onStartLanelet={handleStartLanelet}
+          onFinishLanelet={handleFinishLanelet}
+          onUpsertLanelet={handleUpsertLanelet}
+          nextLaneletIdRef={nextLaneletIdRef}
         />
         {showStats && <Stats className="!left-auto !right-4 !top-4" />}
       </Canvas>
@@ -203,7 +663,6 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
             </span>
           </div>
 
-          {/* Camera mode toggle */}
           <div className="flex items-center rounded-lg border border-white/10 overflow-hidden bg-black/50 backdrop-blur-sm">
             <button
               onClick={() => setCameraMode("3d")}
@@ -250,37 +709,77 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
         )}
       </div>
 
-      {/* ── Tool panel (top-left under header) ──────────────── */}
-      <div className="absolute top-20 left-5 flex flex-col gap-2 rounded-xl border border-white/10 bg-black/60 p-3 backdrop-blur-md w-52">
+      {/* ── Properties panel (when something is selected) ───── */}
+      <LaneletProperties
+        lanelets={lanelets}
+        selectedIds={selectedIds}
+        onUpdate={updateIds}
+        onResizeWidth={resizeWidthIds}
+        onReverse={reverseIds}
+        onDelete={deleteIds}
+        onDeselectAll={deselectAll}
+        onDuplicateNeighbor={duplicateNeighbor}
+      />
+
+      {/* ── Tool panel ──────────────────────────────────────── */}
+      <div className="absolute top-20 left-5 flex flex-col gap-2 rounded-xl border border-white/10 bg-black/60 p-3 backdrop-blur-md w-56">
         <div className="text-[10px] font-mono text-white/40 uppercase tracking-wider">Tool</div>
 
         <button
-          onClick={() => setTool(tool === "place" ? "view" : "place")}
+          onClick={toggleTool}
           className={`flex items-center justify-between px-3 py-2 rounded-md text-xs font-mono transition-colors cursor-pointer border
-            ${tool === "place"
+            ${tool === "lanelet"
               ? "bg-cyan-500/20 text-cyan-300 border-cyan-400/40"
               : "bg-white/5 text-white/60 border-white/10 hover:text-white/80 hover:bg-white/10"}`}
         >
           <span className="flex items-center gap-2">
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={1.8} viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round"
-                d="M15 10.5a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+                d="M4 19 L10 5 L14 5 L20 19 Z" />
               <path strokeLinecap="round" strokeLinejoin="round"
-                d="M19.5 10.5c0 7.142-7.5 11.25-7.5 11.25S4.5 17.642 4.5 10.5a7.5 7.5 0 1 1 15 0Z" />
+                d="M12 6 L12 18" strokeDasharray="1.5 1.5" />
             </svg>
-            Place point
+            Add lanelet
           </span>
-          <span className="text-[10px] text-white/40">{tool === "place" ? "ON" : "OFF"}</span>
+          <span className="text-[10px] text-white/40">{tool === "lanelet" ? "ON" : "OFF"}</span>
         </button>
 
-        <div className="flex items-center justify-between pt-1">
-          <span className="text-[10px] font-mono text-white/40 uppercase">Markers</span>
-          <span className="text-xs font-mono text-white/70">{markers.length}</span>
+        <div className="flex flex-col gap-1.5 pt-1">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-mono text-white/40 uppercase tracking-wider">Width</span>
+            <span className="text-xs font-mono text-white/70">{width.toFixed(1)} m</span>
+          </div>
+          <input
+            type="range"
+            min={0.5}
+            max={10}
+            step={0.1}
+            value={width}
+            onChange={(e) => setWidth(parseFloat(e.target.value))}
+            className="w-full accent-cyan-400 cursor-pointer"
+          />
         </div>
 
+        <div className="flex items-center justify-between pt-1">
+          <span className="text-[10px] font-mono text-white/40 uppercase">Lanelets</span>
+          <span className="text-xs font-mono text-white/70">{lanelets.length}</span>
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] font-mono text-white/40 uppercase">Junctions</span>
+          <span className="text-xs font-mono text-white/70">{junctionPositions.length}</span>
+        </div>
+
+        {pendingStart && (
+          <div className="rounded-md bg-cyan-500/10 border border-cyan-400/30 px-2.5 py-1.5 text-[10px] font-mono text-cyan-300 leading-4">
+            Click the end point…
+            <br />
+            <span className="text-white/50">Esc to cancel</span>
+          </div>
+        )}
+
         <button
-          onClick={() => setMarkers([])}
-          disabled={markers.length === 0}
+          onClick={clearAll}
+          disabled={lanelets.length === 0 && !pendingStart}
           className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-mono text-white/50 border border-white/10 hover:text-white/80 hover:bg-white/5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
@@ -339,7 +838,6 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
 
         <div className="w-px h-5 bg-white/10 mx-1" />
 
-        {/* Z-clip slider: drag LEFT to peel points off the top. */}
         <div className="flex items-center gap-2.5">
           <svg className="w-3.5 h-3.5 text-white/40 shrink-0" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" d="M12 19.5v-15m0 0-6.75 6.75M12 4.5l6.75 6.75" />
@@ -384,20 +882,37 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
         </button>
       </div>
 
-      {/* ── Navigation hint ─────────────────────────────────── */}
+      {/* ── Hint ─────────────────────────────────────────────── */}
       <div className="absolute bottom-5 right-5 text-right pointer-events-none">
-        {tool === "place" ? (
-          <p className="text-[10px] text-cyan-300/80 font-mono leading-5">Click a point on the cloud to drop a marker</p>
+        {tool === "lanelet" ? (
+          pendingStart ? (
+            <p className="text-[10px] text-cyan-300/80 font-mono leading-5">
+              Click the end of the lanelet · Esc to cancel
+            </p>
+          ) : (
+            <p className="text-[10px] text-cyan-300/80 font-mono leading-5">
+              Click the start of the lanelet ({width.toFixed(1)} m wide)
+            </p>
+          )
+        ) : selectedIds.size > 0 ? (
+          <>
+            <p className="text-[10px] text-cyan-300/80 font-mono leading-5">
+              {selectedIds.size === 1 ? "1 lanelet selected" : `${selectedIds.size} lanelets selected`}
+            </p>
+            <p className="text-[10px] text-white/40 font-mono leading-5">Drag cyan dot · move endpoint</p>
+            <p className="text-[10px] text-white/40 font-mono leading-5">Shift-click · add to selection</p>
+            <p className="text-[10px] text-white/40 font-mono leading-5">Del · delete · Esc · deselect</p>
+          </>
         ) : cameraMode === "3d" ? (
           <>
             <p className="text-[10px] text-white/20 font-mono leading-5">Left drag · rotate</p>
             <p className="text-[10px] text-white/20 font-mono leading-5">Right drag · pan</p>
-            <p className="text-[10px] text-white/20 font-mono leading-5">Scroll · zoom</p>
+            <p className="text-[10px] text-white/20 font-mono leading-5">Click a lanelet · select</p>
           </>
         ) : (
           <>
-            <p className="text-[10px] text-white/20 font-mono leading-5">Drag · pan</p>
-            <p className="text-[10px] text-white/20 font-mono leading-5">Scroll · zoom</p>
+            <p className="text-[10px] text-white/20 font-mono leading-5">Drag · pan · Scroll · zoom</p>
+            <p className="text-[10px] text-white/20 font-mono leading-5">Click a lanelet · select</p>
           </>
         )}
       </div>
