@@ -5,6 +5,7 @@ import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls, Grid, Stats } from "@react-three/drei";
 import * as THREE from "three";
 import { PointCloud } from "./PointCloud";
+import type { CropRegion, PointCloudStats } from "./PointCloud";
 import { LaneletLayer } from "./lanelet/LaneletLayer";
 import type { DragHandleState } from "./lanelet/LaneletLayer";
 import { LaneletProperties } from "./lanelet/LaneletProperties";
@@ -41,10 +42,12 @@ import type {
 } from "./lanelet/types";
 
 type CameraMode = "3d" | "2d";
-// "view"      = selection/edit.
-// "lanelet"   = draw a road lanelet.
-// "crosswalk" = draw a crosswalk (no direction arrow, zebra-striped fill).
-type Tool       = "view" | "lanelet" | "crosswalk";
+// "view"        = selection/edit.
+// "lanelet"     = draw a road lanelet.
+// "crosswalk"   = draw a crosswalk (no direction arrow, zebra-striped fill).
+// "crop-center" = one-shot pick mode: next click on the PCD sets the Z-clip
+//                 region's center; the tool auto-returns to "view".
+type Tool       = "view" | "lanelet" | "crosswalk" | "crop-center";
 
 interface SceneProps {
   geometry: THREE.BufferGeometry | null;
@@ -54,6 +57,13 @@ interface SceneProps {
   cameraMode: CameraMode;
   tool: Tool;
   width: number;
+
+  /** Active Z-clip region (null → global Y-clip). */
+  cropRegion: CropRegion | null;
+  /** Invoked when `tool === "crop-center"` and the user clicks a point on
+   *  the cloud. The handler should update the crop center and switch the
+   *  tool back to "view". */
+  onPickCropCenter: (p: Vec3) => void;
 
   registry: NodeRegistry;
   nextNodeIdRef: React.MutableRefObject<number>;
@@ -75,6 +85,10 @@ interface SceneProps {
   onUpsertLanelet: (reg: NodeRegistry, l: Lanelet) => void;
 
   nextLaneletIdRef: React.MutableRefObject<number>;
+
+  /** Forwarded to <PointCloud> — surfaces chunking / voxel progress back
+   *  to the outer stats pill. */
+  onStatsChange?: (stats: PointCloudStats) => void;
 }
 
 function Scene({
@@ -85,6 +99,8 @@ function Scene({
   cameraMode,
   tool,
   width,
+  cropRegion,
+  onPickCropCenter,
   registry,
   nextNodeIdRef,
   lanelets,
@@ -98,10 +114,15 @@ function Scene({
   onFinishLanelet,
   onUpsertLanelet,
   nextLaneletIdRef,
+  onStatsChange,
 }: SceneProps) {
   const { camera, raycaster, gl } = useThree();
   const controlsRef = useRef<any>(null);
-  const pointsRef   = useRef<THREE.Points | null>(null);
+  // Group of chunk <points> objects. `sampleSurfaceY` walks it recursively
+  // and intersectObject's per-child bounding-sphere test early-rejects
+  // tiles the pick ray misses, so raycasting scales with the number of
+  // tiles the ray actually touches, not total point count.
+  const pointsRef   = useRef<THREE.Group | null>(null);
 
   // Always-current reads inside long-running drag handlers.
   const laneletsRef = useRef(lanelets);
@@ -346,6 +367,15 @@ function Scene({
   const endSnapThreshold = Math.max(ATTACH_DISTANCE, width * 0.75);
 
   const handlePick = (p: Vec3) => {
+    // Crop-center picker: consume the click, hand the world point back to
+    // the parent, done. Lanelet creation paths never run in this mode
+    // because `pendingStart` is local to the lanelet flow and gets
+    // cleared when entering "crop-center" via `pickTool`.
+    if (tool === "crop-center") {
+      onPickCropCenter(p);
+      return;
+    }
+
     if (!pendingStart) {
       const snap = findNearestLaneletEnd(
         registryRef.current,
@@ -443,9 +473,23 @@ function Scene({
           voxelSize={voxelSize}
           cameraMode={cameraMode}
           zCeiling={zCeiling}
-          pickEnabled={tool === "lanelet" || tool === "crosswalk"}
+          cropRegion={cropRegion}
+          pickEnabled={
+            tool === "lanelet" ||
+            tool === "crosswalk" ||
+            tool === "crop-center"
+          }
           onPick={handlePick}
           pointsRef={pointsRef}
+          onStatsChange={onStatsChange}
+        />
+      )}
+
+      {cropRegion && geometry?.boundingBox && (
+        <CropBox
+          cropRegion={cropRegion}
+          zCeiling={zCeiling}
+          floorY={geometry.boundingBox.min.y - 0.02}
         />
       )}
 
@@ -467,6 +511,113 @@ function Scene({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Wireframe box outlining the active Z-clip region. The top face sits
+// exactly at `zCeiling` so it doubles as a visual read-out of the current
+// clip plane, and the bottom face sits slightly under the cloud's
+// bounding-box floor so it's clearly visible on inclined terrain.
+//
+// Lines are rendered with depthTest disabled (like the lanelet overlays)
+// so the box stays visible through the PCD in 3D mode.
+// ---------------------------------------------------------------------------
+interface CropBoxProps {
+  cropRegion: CropRegion;
+  zCeiling:   number;
+  floorY:     number;
+}
+
+/**
+ * Wireframe outline of the crop volume.
+ *
+ * Bottom face: axis-aligned rectangle on the cloud floor at `floorY`.
+ * Top face:    the *tilted* clip plane — corners lifted to whatever
+ *              height the fragment shader would discard at that XZ.
+ *
+ * We build 8 vertices imperatively (4 bottom + 4 top) and connect them
+ * with 12 line segments. Can't reuse BoxGeometry/EdgesGeometry because
+ * pitch & roll give us a parallelepiped, not a box, and we want the
+ * floor face to stay flat so the visualization communicates
+ * "bottom grounded, top tilted to follow the slope".
+ *
+ * Coord convention matches the shader exactly:
+ *   localClipHeight(lx, lz) = zCeiling + tan(roll)·lx + tan(pitch)·lz
+ *   worldCorner(lx, lz)     = (cx, cz) + Rz(angle) · (lx, lz)
+ * so what you see is what gets clipped.
+ */
+function CropBox({ cropRegion, zCeiling, floorY }: CropBoxProps) {
+  const { cx, cz, halfW, halfL, angle, pitch, roll } = cropRegion;
+
+  const { geometry, centerY } = useMemo(() => {
+    const cosA = Math.cos(angle);
+    const sinA = Math.sin(angle);
+    const slopeX = Math.tan(roll);
+    const slopeZ = Math.tan(pitch);
+
+    // Local corners CCW in the rectangle's XZ frame.
+    const localCorners: Array<[number, number]> = [
+      [-halfW, -halfL],
+      [ halfW, -halfL],
+      [ halfW,  halfL],
+      [-halfW,  halfL],
+    ];
+
+    // 8 vertices, floats packed xyz·8.
+    const positions = new Float32Array(8 * 3);
+    let topYSum = 0;
+    for (let i = 0; i < 4; i++) {
+      const [lx, lz] = localCorners[i];
+      const wx = cx + cosA * lx - sinA * lz;
+      const wz = cz + sinA * lx + cosA * lz;
+
+      // Bottom vertex at floor.
+      positions[i * 3]     = wx;
+      positions[i * 3 + 1] = floorY;
+      positions[i * 3 + 2] = wz;
+
+      // Top vertex on the tilted clip plane.
+      const topY = zCeiling + slopeX * lx + slopeZ * lz;
+      const ti = (i + 4) * 3;
+      positions[ti]     = wx;
+      positions[ti + 1] = topY;
+      positions[ti + 2] = wz;
+      topYSum += topY;
+    }
+
+    const indices = new Uint16Array([
+      0, 1, 1, 2, 2, 3, 3, 0,   // bottom edges
+      4, 5, 5, 6, 6, 7, 7, 4,   // top edges
+      0, 4, 1, 5, 2, 6, 3, 7,   // verticals
+    ]);
+
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    g.setIndex(new THREE.BufferAttribute(indices, 1));
+    return { geometry: g, centerY: (topYSum / 4 + floorY) * 0.5 };
+  }, [cx, cz, halfW, halfL, angle, pitch, roll, zCeiling, floorY]);
+
+  // Reference centerY so the linter knows it's used (it's useful for
+  // debugging/observability; kept off the render path intentionally).
+  void centerY;
+
+  // Free GPU buffers when the component unmounts or geometry is
+  // rebuilt — React's ref-cleanup runs before the next useMemo result
+  // is committed, so this catches every rebuild.
+  useEffect(() => () => geometry.dispose(), [geometry]);
+
+  return (
+    <lineSegments renderOrder={9}>
+      <primitive object={geometry} attach="geometry" />
+      <lineBasicMaterial
+        color="#facc15"
+        transparent
+        opacity={0.9}
+        depthTest={false}
+        depthWrite={false}
+      />
+    </lineSegments>
+  );
+}
+
 interface SceneViewerProps {
   geometry: THREE.BufferGeometry | null;
   fileName: string;
@@ -479,6 +630,9 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
   const [pointSize3d,   setPointSize3d]   = useState(0.03);
   const [pointSize2d,   setPointSize2d]   = useState(2);
   const [voxelSize,     setVoxelSize]     = useState(0);
+  // Live status from the PointCloud worker pipeline (voxel + chunking).
+  // Null until first ingest completes.
+  const [cloudStats,    setCloudStats]    = useState<PointCloudStats | null>(null);
   const [showStats,     setShowStats]     = useState(false);
   const [tool,          setTool]          = useState<Tool>("view");
   const [width,         setWidth]         = useState(3);
@@ -503,6 +657,96 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
   const ySpan = Math.max(yMax - yMin, 1e-6);
   const yStep = ySpan / 200;
   const [zCeiling, setZCeiling] = useState<number>(yMax);
+
+  // Oriented XZ crop region the Y-clip is scoped to. When disabled, the
+  // slider behaves globally (original behaviour).
+  //
+  // `angle` is the yaw of the rectangle's local X axis away from world X,
+  // in radians, right-handed around +Y (matching Three.js convention and
+  // the shader's uCropRot sign). Exposed to the user in degrees.
+  //
+  // Motivation: a hillside street that runs diagonally needs a rotated
+  // rectangle, otherwise the user has to oversize W and L to cover the
+  // road, which brings back the same diagonal-cut problem we're trying
+  // to avoid.
+  interface CropState {
+    enabled: boolean;
+    cx:      number;
+    cz:      number;
+    width:   number;   // size along the rectangle's local X
+    length:  number;   // size along the rectangle's local Z
+    angle:   number;   // yaw   around +Y,       radians
+    pitch:   number;   // tilt  around local X,  radians (street uphill)
+    roll:    number;   // tilt  around local Z,  radians (camber / side)
+  }
+  const [crop, setCrop] = useState<CropState>({
+    enabled: false,
+    cx:      0,
+    cz:      0,
+    width:   20,
+    length:  20,
+    angle:   0,
+    pitch:   0,
+    roll:    0,
+  });
+
+  // Reset crop center to the cloud's footprint centroid whenever a new
+  // cloud is loaded — the old center would almost certainly sit outside
+  // the new map. Width/length/angle keep the user's last choice so
+  // reloading a similar map doesn't stomp on their setup.
+  useEffect(() => {
+    if (!geometry?.boundingBox) return;
+    const b = geometry.boundingBox;
+    setCrop((c) => ({
+      ...c,
+      enabled: false,
+      cx: (b.min.x + b.max.x) * 0.5,
+      cz: (b.min.z + b.max.z) * 0.5,
+    }));
+  }, [geometry]);
+
+  // Packed uniform-ready region handed down to Scene / PointCloud.
+  const cropRegion = useMemo<CropRegion | null>(
+    () =>
+      crop.enabled
+        ? {
+            cx:    crop.cx,
+            cz:    crop.cz,
+            halfW: crop.width  * 0.5,
+            halfL: crop.length * 0.5,
+            angle: crop.angle,
+            pitch: crop.pitch,
+            roll:  crop.roll,
+          }
+        : null,
+    [
+      crop.enabled,
+      crop.cx,
+      crop.cz,
+      crop.width,
+      crop.length,
+      crop.angle,
+      crop.pitch,
+      crop.roll,
+    ]
+  );
+
+  // Center X/Z slider ranges follow the map footprint, padded by the
+  // rectangle's worst-case diagonal so the center can still slide past
+  // the bbox edge even when the rectangle is rotated.
+  const diag = Math.hypot(crop.width, crop.length);
+  const xMin = bbox ? bbox.min.x - diag : -50;
+  const xMax = bbox ? bbox.max.x + diag :  50;
+  const zMin = bbox ? bbox.min.z - diag : -50;
+  const zMax = bbox ? bbox.max.z + diag :  50;
+  const xzStep = Math.max(0.01, (ySpan + Math.max(xMax - xMin, zMax - zMin)) / 2000);
+  // Hard caps per user request — W/L range is simply 0–100 m regardless
+  // of the underlying map size. Below 0.5 m the rectangle is effectively
+  // a line (and the shader guard clamps to 1 mm anyway), so that's the
+  // slider floor; step 0.5 gives decimetre precision across the range.
+  const WL_MIN  = 0.5;
+  const WL_MAX  = 100;
+  const WL_STEP = 0.5;
 
   // Reset on new geometry
   useEffect(() => {
@@ -680,7 +924,9 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
       if (t && /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
 
       if (e.key === "Escape") {
-        if (pendingStart) {
+        if (tool === "crop-center") {
+          setTool("view");
+        } else if (pendingStart) {
           setPendingStart(null);
           setPendingStartSnap(null);
         }
@@ -695,7 +941,7 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingStart, selectedIds]);
+  }, [pendingStart, selectedIds, tool]);
 
   /**
    * Toolbar button behaviour: clicking the same tool that's already active
@@ -713,6 +959,20 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
     setTool(next);
     setPendingStart(null);
     setPendingStartSnap(null);
+  };
+
+  /**
+   * Consume a "set crop center" click from the PCD: recenter the rectangle
+   * on the clicked point, enable the crop if it was off (otherwise the
+   * click would do nothing visible), and return to "view" mode.
+   *
+   * Only X and Z are used — the rectangle is always axis-aligned and
+   * sits vertically from scene floor to zCeiling, so the click's Y
+   * doesn't matter.
+   */
+  const handlePickCropCenter = (p: Vec3) => {
+    setCrop((c) => ({ ...c, enabled: true, cx: p[0], cz: p[2] }));
+    setTool("view");
   };
 
   const handleStartLanelet = (p: Vec3, snap: LaneletEndSnap | null) => {
@@ -762,6 +1022,8 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
           cameraMode={cameraMode}
           tool={tool}
           width={width}
+          cropRegion={cropRegion}
+          onPickCropCenter={handlePickCropCenter}
           registry={registry}
           nextNodeIdRef={nextNodeIdRef}
           lanelets={lanelets}
@@ -775,6 +1037,7 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
           onFinishLanelet={handleFinishLanelet}
           onUpsertLanelet={handleUpsertLanelet}
           nextLaneletIdRef={nextLaneletIdRef}
+          onStatsChange={setCloudStats}
         />
         {showStats && <Stats className="!left-auto !right-4 !top-4" />}
       </Canvas>
@@ -829,8 +1092,44 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
               </svg>
               <span className="text-xs text-white/70 font-mono max-w-[160px] truncate">{fileName}</span>
             </div>
+            {/* Cloud stats. Shows live progress while the worker
+                is voxeling / chunking a freshly loaded cloud, then
+                collapses to "raw → voxel · chunk count" when ready. */}
             <div className="rounded-md border border-white/10 bg-white/5 px-3 py-1.5 backdrop-blur-sm">
-              <span className="text-xs text-white/50 font-mono">{pointCount.toLocaleString()} pts</span>
+              {cloudStats?.phase === "processing" ? (
+                <div className="flex items-center gap-2">
+                  <div className="relative h-2 w-2">
+                    <div className="absolute inset-0 rounded-full bg-amber-400 animate-pulse" />
+                  </div>
+                  <span className="text-[11px] text-amber-200/90 font-mono tracking-wide">
+                    {cloudStats.message ?? "Processing…"}
+                  </span>
+                  <span className="text-[11px] text-amber-200/70 font-mono">
+                    {cloudStats.progress != null
+                      ? `${Math.round(cloudStats.progress * 100)}%`
+                      : ""}
+                  </span>
+                </div>
+              ) : cloudStats?.phase === "ready" ? (
+                <span
+                  className="text-xs text-white/50 font-mono"
+                  title={`Raw points: ${cloudStats.rawPoints.toLocaleString()}`}
+                >
+                  {cloudStats.rawPoints.toLocaleString()} →{" "}
+                  <span className="text-cyan-300/90">
+                    {cloudStats.voxelPoints.toLocaleString()}
+                  </span>{" "}
+                  pts · {cloudStats.chunkCount} tiles
+                </span>
+              ) : cloudStats?.phase === "error" ? (
+                <span className="text-xs text-rose-300/90 font-mono" title={cloudStats.message}>
+                  cloud err — fallback
+                </span>
+              ) : (
+                <span className="text-xs text-white/50 font-mono">
+                  {pointCount.toLocaleString()} pts
+                </span>
+              )}
             </div>
           </div>
         )}
@@ -953,6 +1252,193 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
         </button>
       </div>
 
+      {/* ── Z-clip region panel (appears when region is on) ─── */}
+      {crop.enabled && bbox && (
+        <div className="absolute bottom-[72px] left-1/2 -translate-x-1/2 flex flex-col gap-2 rounded-xl border border-amber-300/30 bg-black/70 px-4 py-2 backdrop-blur-md shadow-[0_0_20px_rgba(251,191,36,0.08)]">
+          {/* ── Row 1: placement + footprint ─────────────────── */}
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1.5">
+              <div className="h-1.5 w-1.5 rounded-full bg-amber-300 shadow-[0_0_6px_rgba(251,191,36,0.9)]" />
+              <span className="text-[10px] font-mono uppercase tracking-wider text-amber-200/80">Z-clip region</span>
+            </div>
+
+            <div className="w-px h-5 bg-white/10" />
+
+            <button
+              onClick={() => setTool(tool === "crop-center" ? "view" : "crop-center")}
+              className={`flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded-md border transition-colors cursor-pointer
+                ${tool === "crop-center"
+                  ? "bg-amber-400/30 border-amber-300/60 text-amber-100"
+                  : "bg-white/5 border-white/10 text-white/70 hover:text-white hover:bg-white/10"}`}
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="3" />
+                <path strokeLinecap="round" d="M12 2v4M12 18v4M2 12h4M18 12h4" />
+              </svg>
+              {tool === "crop-center" ? "Click on the cloud…" : "Pick center"}
+            </button>
+
+            <button
+              onClick={() => {
+                const b = geometry!.boundingBox!;
+                setCrop((c) => ({
+                  ...c,
+                  cx: (b.min.x + b.max.x) * 0.5,
+                  cz: (b.min.z + b.max.z) * 0.5,
+                }));
+              }}
+              title="Recenter on the cloud"
+              className="flex items-center gap-1 text-[10px] font-mono px-2 py-1 rounded-md border bg-white/5 border-white/10 text-white/70 hover:text-white hover:bg-white/10 cursor-pointer"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="8" />
+                <circle cx="12" cy="12" r="2" fill="currentColor" />
+              </svg>
+              Recenter
+            </button>
+
+            <div className="w-px h-5 bg-white/10" />
+
+            {/* Center X */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-mono text-white/40">X</span>
+              <input
+                type="range"
+                min={xMin}
+                max={xMax}
+                step={xzStep}
+                value={crop.cx}
+                onChange={(e) => setCrop((c) => ({ ...c, cx: parseFloat(e.target.value) }))}
+                className="w-20 accent-amber-300 cursor-pointer"
+              />
+              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">{crop.cx.toFixed(1)}</span>
+            </div>
+
+            {/* Center Z (ground-plane second axis; label as "Z" to match
+                Three.js world coords). */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-mono text-white/40">Z</span>
+              <input
+                type="range"
+                min={zMin}
+                max={zMax}
+                step={xzStep}
+                value={crop.cz}
+                onChange={(e) => setCrop((c) => ({ ...c, cz: parseFloat(e.target.value) }))}
+                className="w-20 accent-amber-300 cursor-pointer"
+              />
+              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">{crop.cz.toFixed(1)}</span>
+            </div>
+
+            <div className="w-px h-5 bg-white/10" />
+
+            {/* Rectangle width (local X) */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-mono text-white/40">W</span>
+              <input
+                type="range"
+                min={WL_MIN}
+                max={WL_MAX}
+                step={WL_STEP}
+                value={crop.width}
+                onChange={(e) => setCrop((c) => ({ ...c, width: parseFloat(e.target.value) }))}
+                className="w-20 accent-amber-300 cursor-pointer"
+              />
+              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">{crop.width.toFixed(1)}m</span>
+            </div>
+
+            {/* Rectangle length (local Z) */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-mono text-white/40">L</span>
+              <input
+                type="range"
+                min={WL_MIN}
+                max={WL_MAX}
+                step={WL_STEP}
+                value={crop.length}
+                onChange={(e) => setCrop((c) => ({ ...c, length: parseFloat(e.target.value) }))}
+                className="w-20 accent-amber-300 cursor-pointer"
+              />
+              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">{crop.length.toFixed(1)}m</span>
+            </div>
+          </div>
+
+          {/* ── Row 2: clip-plane tilt (pitch / roll) ─────────── */}
+          <div className="flex items-center gap-3 pl-[110px]">
+            <span className="text-[9px] font-mono uppercase tracking-wider text-amber-200/60">Tilt</span>
+
+            <button
+              onClick={() =>
+                setCrop((c) => ({ ...c, pitch: 0, roll: 0 }))
+              }
+              title="Reset tilt"
+              className="text-[10px] font-mono px-2 py-0.5 rounded border bg-white/5 border-white/10 text-white/60 hover:text-white hover:bg-white/10 cursor-pointer"
+            >
+              Reset
+            </button>
+
+            <div className="w-px h-5 bg-white/10" />
+
+            {/* Pitch — tilt the clip plane along the rectangle's length.
+                Positive = plane rises toward local +Z (street going
+                uphill along its length). Shader clamps to ±85°. */}
+            <div className="flex items-center gap-1.5" title="Pitch · tilt clip plane along length (street uphill)">
+              <svg className="w-3 h-3 text-white/40" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 17 L21 7" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 17 L21 17" strokeDasharray="2 2" opacity="0.5" />
+              </svg>
+              <span className="text-[10px] font-mono text-white/40">Pitch</span>
+              <input
+                type="range"
+                min={-60}
+                max={60}
+                step={0.5}
+                value={Number(((crop.pitch * 180) / Math.PI).toFixed(1))}
+                onChange={(e) =>
+                  setCrop((c) => ({
+                    ...c,
+                    pitch: (parseFloat(e.target.value) * Math.PI) / 180,
+                  }))
+                }
+                onDoubleClick={() => setCrop((c) => ({ ...c, pitch: 0 }))}
+                className="w-24 accent-amber-300 cursor-pointer"
+              />
+              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">
+                {((crop.pitch * 180) / Math.PI).toFixed(1)}°
+              </span>
+            </div>
+
+            {/* Roll — tilt the clip plane across the rectangle's width.
+                Positive = plane rises toward local +X (road camber). */}
+            <div className="flex items-center gap-1.5" title="Roll · tilt clip plane across width (camber)">
+              <svg className="w-3 h-3 text-white/40" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M21 17 L3 7" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 17 L21 17" strokeDasharray="2 2" opacity="0.5" />
+              </svg>
+              <span className="text-[10px] font-mono text-white/40">Roll</span>
+              <input
+                type="range"
+                min={-60}
+                max={60}
+                step={0.5}
+                value={Number(((crop.roll * 180) / Math.PI).toFixed(1))}
+                onChange={(e) =>
+                  setCrop((c) => ({
+                    ...c,
+                    roll: (parseFloat(e.target.value) * Math.PI) / 180,
+                  }))
+                }
+                onDoubleClick={() => setCrop((c) => ({ ...c, roll: 0 }))}
+                className="w-24 accent-amber-300 cursor-pointer"
+              />
+              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">
+                {((crop.roll * 180) / Math.PI).toFixed(1)}°
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Bottom toolbar ──────────────────────────────────── */}
       <div className="absolute bottom-5 left-1/2 -translate-x-1/2 flex items-center gap-2 rounded-xl border border-white/10 bg-black/60 px-4 py-2.5 backdrop-blur-md">
 
@@ -1019,6 +1505,25 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
           <span className={`text-xs font-mono w-14 ${zCeiling < yMax ? "text-cyan-400" : "text-white/30"}`}>
             {bbox ? `${zCeiling.toFixed(2)} m` : "—"}
           </span>
+          <button
+            onClick={() => setCrop((c) => ({ ...c, enabled: !c.enabled }))}
+            disabled={!bbox}
+            title={
+              crop.enabled
+                ? "Z-clip only affects the yellow region"
+                : "Limit Z-clip to a rectangular region"
+            }
+            className={`flex items-center gap-1 text-[10px] font-mono px-2 py-1 rounded-md border transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed
+              ${crop.enabled
+                ? "bg-amber-400/20 border-amber-300/40 text-amber-200"
+                : "bg-white/5 border-white/10 text-white/50 hover:text-white/80"}`}
+          >
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round"
+                d="M9 4.5h10.5v10.5M14.5 19.5H4V9" />
+            </svg>
+            Region
+          </button>
         </div>
 
         <div className="w-px h-5 bg-white/10 mx-1" />
@@ -1047,7 +1552,11 @@ export function SceneViewer({ geometry, fileName, pointCount, onReset }: SceneVi
 
       {/* ── Hint ─────────────────────────────────────────────── */}
       <div className="absolute bottom-5 right-5 text-right pointer-events-none">
-        {tool !== "view" ? (
+        {tool === "crop-center" ? (
+          <p className="text-[10px] font-mono leading-5 text-amber-200/80">
+            Click on the cloud · set region center · Esc to cancel
+          </p>
+        ) : tool !== "view" ? (
           pendingStart ? (
             <p className={`text-[10px] font-mono leading-5 ${tool === "crosswalk" ? "text-sky-300/80" : "text-cyan-300/80"}`}>
               Click the end of the {tool} · Esc to cancel

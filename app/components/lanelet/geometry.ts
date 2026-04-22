@@ -62,10 +62,19 @@ function lerp(a: Vec3, b: Vec3, t: number): Vec3 {
   ];
 }
 
-/** Cheap ray-down-through-points Y sample for surface snapping. */
+/**
+ * Cheap ray-down-through-points Y sample for surface snapping.
+ *
+ * `pointsMesh` can be either a single `THREE.Points` (old single-buffer
+ * layout) or a `THREE.Group` of `Points` chunks — after the cloud was
+ * spatially tiled we pass the parent group here. `intersectObject(..., true)`
+ * walks the group's descendants, and each chunk's bounding sphere gives
+ * a free early-out so we only scan the tile(s) the downward ray actually
+ * passes through.
+ */
 export function sampleSurfaceY(
   rc: THREE.Raycaster,
-  pointsMesh: THREE.Points | null,
+  pointsMesh: THREE.Object3D | null,
   x: number,
   z: number,
   topY: number,
@@ -73,7 +82,7 @@ export function sampleSurfaceY(
 ): number {
   if (!pointsMesh) return fallbackY;
   rc.set(new THREE.Vector3(x, topY, z), new THREE.Vector3(0, -1, 0));
-  const hits = rc.intersectObject(pointsMesh, false);
+  const hits = rc.intersectObject(pointsMesh, true);
   return hits.length > 0 ? hits[0].point.y : fallbackY;
 }
 
