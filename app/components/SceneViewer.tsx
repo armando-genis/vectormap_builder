@@ -11,7 +11,7 @@ import {
   createLanelet,
   duplicateLaneletLeft,
   duplicateLaneletRight,
-  moveLaneletEndpoint,
+  moveLaneletNodeAtIndex,
   resizeLaneletWidth,
   reverseLanelet,
   sampleSurfaceY,
@@ -102,8 +102,12 @@ function Scene({
   useEffect(() => { registryRef.current = registry;   }, [registry]);
   useEffect(() => { onUpsertRef.current = onUpsertLanelet; }, [onUpsertLanelet]);
 
+  // `index` is a position in the lanelet's centerline polyline:
+  //   0           → start endpoint
+  //   last        → end endpoint
+  //   everything in between → interior shape-control node
   const [dragHandle, setDragHandle] = useState<
-    { id: number; which: "start" | "end" } | null
+    { id: number; index: number } | null
   >(null);
 
   const surfaceRc = useMemo(() => new THREE.Raycaster(), []);
@@ -149,14 +153,15 @@ function Scene({
   }, [geometry, cameraMode, camera]);
 
   // --------------------------------------------------------------------
-  // Drag handles — translate the centerStart/centerEnd of a lanelet. The
-  // two boundary nodes at that end move by the same delta. Because those
-  // NodeIds are shared with any connected neighbor, the whole junction
-  // follows coherently (no extra bookkeeping).
+  // Drag handles — translate a single centerline node (endpoint or interior
+  // shape-control). The two boundary nodes at that index move by the same
+  // delta. Shared NodeIds cascade the move to any connected neighbor, so
+  // junctions stay coherent without extra bookkeeping; interior drags bend
+  // only the lanelet being edited.
   // --------------------------------------------------------------------
-  const handleHandlePointerDown = (id: number, which: "start" | "end") => {
+  const handleHandlePointerDown = (id: number, index: number) => {
     if (controlsRef.current) controlsRef.current.enabled = false;
-    setDragHandle({ id, which });
+    setDragHandle({ id, index });
   };
 
   useEffect(() => {
@@ -177,16 +182,14 @@ function Scene({
     }
 
     // Drag plane Y = current midpoint Y of the two boundary nodes at this
-    // end. Derived here (not read off the lanelet) because the centerline
+    // index. Derived here (not read off the lanelet) because the centerline
     // is no longer stored — it's always computed from the registry.
     const reg0    = registryRef.current;
-    const leftId  = dragHandle.which === "start"
-      ? initial.leftBoundary[0]  : initial.leftBoundary[1];
-    const rightId = dragHandle.which === "start"
-      ? initial.rightBoundary[0] : initial.rightBoundary[1];
-    const leftP  = reg0.nodes[leftId];
-    const rightP = reg0.nodes[rightId];
-    const planeY = leftP && rightP ? (leftP[1] + rightP[1]) * 0.5 : 0;
+    const leftId  = initial.leftBoundary[dragHandle.index];
+    const rightId = initial.rightBoundary[dragHandle.index];
+    const leftP   = leftId  !== undefined ? reg0.nodes[leftId]  : undefined;
+    const rightP  = rightId !== undefined ? reg0.nodes[rightId] : undefined;
+    const planeY  = leftP && rightP ? (leftP[1] + rightP[1]) * 0.5 : 0;
 
     const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -planeY);
     const dragRc = new THREE.Raycaster();
@@ -212,10 +215,10 @@ function Scene({
       const curr = laneletsRef.current.find((l) => l.id === dragHandle.id);
       if (!curr) return;
 
-      const { reg, lanelet } = moveLaneletEndpoint(
+      const { reg, lanelet } = moveLaneletNodeAtIndex(
         registryRef.current,
         curr,
-        dragHandle.which,
+        dragHandle.index,
         np
       );
       onUpsertRef.current(reg, lanelet);

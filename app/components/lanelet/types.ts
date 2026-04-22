@@ -57,21 +57,27 @@ export type LineSubType = "solid" | "dashed";
  * in a neighboring lanelet automatically moves this lanelet's centerline
  * and arrow along with it.
  *
- * Two lanelets with `leftBoundary[1]` equal to some other lanelet's
- * `leftBoundary[0]` are structurally connected (they share a corner) with
- * no extra bookkeeping.
+ * Two lanelets whose last boundary NodeId (end side) equals some other
+ * lanelet's first boundary NodeId (start side) are structurally connected
+ * (they share a corner) with no extra bookkeeping.
  */
 export interface Lanelet {
   id: number;
 
   /**
-   * Left boundary: 2 NodeIds [start-side, end-side].
-   * "Left" is relative to the direction of travel
+   * Left boundary as an ordered polyline of NodeIds, `length >= 2`.
+   * Index 0 is the start side, last index is the end side, interior
+   * indices are shape-controlling nodes the user can drag to bend the
+   * lanelet (curves, turns, s-shapes, …) — same model as MapToolbox's
+   * `Way.Nodes` list. "Left" is relative to travel direction
    * (start-side → end-side).
+   *
+   * Invariant: leftBoundary.length === rightBoundary.length. Each index
+   * pairs a left node with a right node at the same centerline position.
    */
-  leftBoundary:  [NodeId, NodeId];
-  /** Right boundary: 2 NodeIds [start-side, end-side]. */
-  rightBoundary: [NodeId, NodeId];
+  leftBoundary:  NodeId[];
+  /** Right boundary polyline; same length as `leftBoundary`. */
+  rightBoundary: NodeId[];
 
   /** Lateral width in metres, used as a target by resize and by the default
    *  rectangle placement at creation. Not enforced as an invariant — drag
@@ -102,13 +108,38 @@ export interface Lanelet {
  */
 export interface ResolvedLanelet
   extends Omit<Lanelet, "leftBoundary" | "rightBoundary"> {
-  leftBoundary:  [Vec3, Vec3];
-  rightBoundary: [Vec3, Vec3];
-  leftBoundaryIds:  [NodeId, NodeId];
-  rightBoundaryIds: [NodeId, NodeId];
+  /** Left boundary positions, same length & order as the stored NodeIds. */
+  leftBoundary:  Vec3[];
+  /** Right boundary positions, same length & order. */
+  rightBoundary: Vec3[];
+  leftBoundaryIds:  NodeId[];
+  rightBoundaryIds: NodeId[];
 
-  /** Midpoint of (leftBoundary[0], rightBoundary[0]) — derived, not stored. */
+  /**
+   * Derived centerline polyline — one point per boundary index, computed
+   * as the midpoint of (leftBoundary[i], rightBoundary[i]). Length equals
+   * `leftBoundary.length`. This is the "control polyline" — what drag
+   * handles clamp to — *not* the rendered shape.
+   */
+  centerline: Vec3[];
+
+  /**
+   * Smooth sampled boundary polylines (centripetal Catmull–Rom through the
+   * control boundary nodes). These are what actually get rendered — fill
+   * ribbon, boundary lines and centerline — so curves look continuous
+   * instead of showing a crease at every interior control node.
+   *
+   * `leftSmooth` and `rightSmooth` always have the same length; their
+   * first sample coincides with the start control node and their last
+   * sample coincides with the end control node.
+   */
+  leftSmooth:   Vec3[];
+  rightSmooth:  Vec3[];
+  /** Per-index midpoint of (leftSmooth, rightSmooth). */
+  centerSmooth: Vec3[];
+
+  /** Shortcut for centerline[0] (and centerSmooth[0]). */
   centerStart: Vec3;
-  /** Midpoint of (leftBoundary[1], rightBoundary[1]) — derived, not stored. */
+  /** Shortcut for centerline[last] (and centerSmooth[last]). */
   centerEnd:   Vec3;
 }

@@ -9,6 +9,7 @@
 // `NodeRegistry`. That keeps it safe to put in React state and trivially
 // comparable for re-render decisions.
 
+import * as THREE from "three";
 import type {
   Lanelet,
   MapNode,
@@ -17,6 +18,49 @@ import type {
   ResolvedLanelet,
   Vec3,
 } from "./types";
+
+/**
+ * How many dense samples to emit between consecutive control nodes when
+ * smoothing a boundary polyline. 12 segments ≈ no visible crease at typical
+ * zoom. Higher = smoother + slower; lower = visible facets.
+ */
+const SMOOTH_SAMPLES_PER_SEGMENT = 12;
+
+/**
+ * Smooth a control polyline with centripetal Catmull–Rom. The curve passes
+ * exactly through every control point, doesn't cusp on sharp angles, and
+ * degenerates gracefully for length-2 inputs (straight line).
+ *
+ * Output length = `samplesPerSegment * (ctrl.length - 1) + 1` for ctrl ≥ 2,
+ * so the first and last samples coincide with the first and last control
+ * nodes — important for the boundary polylines to start/end at the
+ * junction NodeIds that neighbors share.
+ */
+function smoothPolyline(
+  ctrl: Vec3[],
+  samplesPerSegment: number = SMOOTH_SAMPLES_PER_SEGMENT
+): Vec3[] {
+  if (ctrl.length < 2) return ctrl.map((p) => [p[0], p[1], p[2]] as Vec3);
+  if (ctrl.length === 2) {
+    // CatmullRomCurve3 with 2 points is degenerate; straight line is fine.
+    return [
+      [ctrl[0][0], ctrl[0][1], ctrl[0][2]],
+      [ctrl[1][0], ctrl[1][1], ctrl[1][2]],
+    ];
+  }
+
+  const pts = ctrl.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
+  const curve = new THREE.CatmullRomCurve3(pts, false, "centripetal", 0.5);
+
+  const total = samplesPerSegment * (ctrl.length - 1);
+  const out: Vec3[] = new Array(total + 1);
+  const v = new THREE.Vector3();
+  for (let i = 0; i <= total; i++) {
+    curve.getPoint(i / total, v);
+    out[i] = [v.x, v.y, v.z];
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -112,10 +156,8 @@ export function gcUnused(
 ): NodeRegistry {
   const keep = new Set<NodeId>();
   for (const l of lanelets) {
-    keep.add(l.leftBoundary[0]);
-    keep.add(l.leftBoundary[1]);
-    keep.add(l.rightBoundary[0]);
-    keep.add(l.rightBoundary[1]);
+    for (const id of l.leftBoundary)  keep.add(id);
+    for (const id of l.rightBoundary) keep.add(id);
   }
 
   const next: Record<NodeId, Vec3> = {};
@@ -194,34 +236,56 @@ export function resolveLanelet(
   reg: NodeRegistry,
   l: Lanelet
 ): ResolvedLanelet {
-  const ls = getNode(reg, l.leftBoundary[0]);
-  const le = getNode(reg, l.leftBoundary[1]);
-  const rs = getNode(reg, l.rightBoundary[0]);
-  const re = getNode(reg, l.rightBoundary[1]);
+  // Boundaries are polylines; same length on both sides by invariant.
+  const leftPos:  Vec3[] = l.leftBoundary.map((id)  => getNode(reg, id));
+  const rightPos: Vec3[] = l.rightBoundary.map((id) => getNode(reg, id));
 
-  // Derived centerline — midpoint of the two boundary nodes at each end.
-  // Because this is recomputed every resolve, moving a boundary node
-  // (even by dragging a connected neighbor lanelet) immediately updates
-  // this lanelet's centerline and arrow without any explicit sync.
-  const centerStart: Vec3 = [
-    (ls[0] + rs[0]) * 0.5,
-    (ls[1] + rs[1]) * 0.5,
-    (ls[2] + rs[2]) * 0.5,
-  ];
-  const centerEnd: Vec3 = [
-    (le[0] + re[0]) * 0.5,
-    (le[1] + re[1]) * 0.5,
-    (le[2] + re[2]) * 0.5,
-  ];
+  // Derived centerline — per-index midpoint of the two boundary polylines.
+  // Recomputed every resolve, so moving a boundary node (even via a
+  // neighbor's shared-junction drag) immediately updates this lanelet's
+  // centerline, arrow, and drag-handle positions without manual sync.
+  const n = leftPos.length;
+  const centerline: Vec3[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const lp = leftPos[i];
+    const rp = rightPos[i];
+    centerline[i] = [
+      (lp[0] + rp[0]) * 0.5,
+      (lp[1] + rp[1]) * 0.5,
+      (lp[2] + rp[2]) * 0.5,
+    ];
+  }
+
+  // Smooth sampled polylines — centripetal Catmull–Rom through the control
+  // nodes. These are what LaneletLayer actually renders (fill strip,
+  // boundary lines, centerline). Drag handles keep using `centerline` above
+  // because handles belong at real control nodes, not mid-spline samples.
+  const leftSmooth  = smoothPolyline(leftPos);
+  const rightSmooth = smoothPolyline(rightPos);
+  const m = leftSmooth.length;
+  const centerSmooth: Vec3[] = new Array(m);
+  for (let i = 0; i < m; i++) {
+    const lp = leftSmooth[i];
+    const rp = rightSmooth[i];
+    centerSmooth[i] = [
+      (lp[0] + rp[0]) * 0.5,
+      (lp[1] + rp[1]) * 0.5,
+      (lp[2] + rp[2]) * 0.5,
+    ];
+  }
 
   return {
     ...l,
     leftBoundaryIds:  l.leftBoundary,
     rightBoundaryIds: l.rightBoundary,
-    leftBoundary:  [ls, le],
-    rightBoundary: [rs, re],
-    centerStart,
-    centerEnd,
+    leftBoundary:  leftPos,
+    rightBoundary: rightPos,
+    centerline,
+    leftSmooth,
+    rightSmooth,
+    centerSmooth,
+    centerStart: centerline[0],
+    centerEnd:   centerline[n - 1],
   };
 }
 
@@ -277,9 +341,11 @@ export function findNearestLaneletEnd(
   let bestD = threshold;
 
   for (const l of lanelets) {
+    const last = l.leftBoundary.length - 1;
     for (const end of ["start", "end"] as const) {
-      const leftId  = end === "start" ? l.leftBoundary[0]  : l.leftBoundary[1];
-      const rightId = end === "start" ? l.rightBoundary[0] : l.rightBoundary[1];
+      const idx = end === "start" ? 0 : last;
+      const leftId  = l.leftBoundary[idx];
+      const rightId = l.rightBoundary[idx];
       const leftPos  = getNode(reg, leftId);
       const rightPos = getNode(reg, rightId);
 
@@ -327,10 +393,8 @@ export function nodeRefCount(
     out[id] = (out[id] ?? 0) + 1;
   };
   for (const l of lanelets) {
-    bump(l.leftBoundary[0]);
-    bump(l.leftBoundary[1]);
-    bump(l.rightBoundary[0]);
-    bump(l.rightBoundary[1]);
+    for (const id of l.leftBoundary)  bump(id);
+    for (const id of l.rightBoundary) bump(id);
   }
   return out;
 }
