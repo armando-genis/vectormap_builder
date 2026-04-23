@@ -12,6 +12,7 @@ import type { DragHandleState } from "./lanelet/LaneletLayer";
 import { LaneletProperties } from "./lanelet/LaneletProperties";
 import {
   applyLaneletTranslationFromSnapshot,
+  collectNodeIdsOfOtherSubType,
   createLanelet,
   duplicateLaneletLeft,
   duplicateLaneletRight,
@@ -21,16 +22,19 @@ import {
   reverseLanelet,
   sampleSurfaceY,
   snapLaneletToSurface,
+  straightenLanelet,
   ATTACH_DISTANCE,
 } from "./lanelet/geometry";
 import type { JointType } from "./lanelet/geometry";
 import {
+  addNode,
   createRegistry,
   findNearestLaneletEnd,
   gcUnused,
+  getNode,
+  getNodeOrNull,
   junctionNodeIds,
   resolveAll,
-  getNodeOrNull,
 } from "./lanelet/registry";
 import { downloadLanelet2Osm } from "./lanelet/export";
 import type { LaneletEndSnap } from "./lanelet/registry";
@@ -63,6 +67,8 @@ interface SceneProps {
 
   /** Active Z-clip region (null → global Y-clip). */
   cropRegion: CropRegion | null;
+  /** Show the translucent amber fill on the crop box's tilted top face. */
+  showCropCap: boolean;
   /** Invoked when `tool === "crop-center"` and the user clicks a point on
    *  the cloud. The handler should update the crop center and switch the
    *  tool back to "view". */
@@ -99,6 +105,7 @@ function Scene({
   tool,
   width,
   cropRegion,
+  showCropCap,
   onPickCropCenter,
   registry,
   nextNodeIdRef,
@@ -374,12 +381,25 @@ function Scene({
       return;
     }
 
+    // The drawing tool determines the kind we're creating. Crosswalks
+    // must NEVER attach to road lanelets (they're physically on top of
+    // roads but semantically separate), so both snap paths filter by
+    // subType and we reserve every other-kind NodeId from per-corner
+    // attach too.
+    const newSubType: "road" | "crosswalk" =
+      tool === "crosswalk" ? "crosswalk" : "road";
+    const reservedNodeIds = collectNodeIdsOfOtherSubType(
+      laneletsRef.current,
+      newSubType,
+    );
+
     if (!pendingStart) {
       const snap = findNearestLaneletEnd(
         registryRef.current,
         laneletsRef.current,
         p,
-        endSnapThreshold
+        endSnapThreshold,
+        newSubType,
       );
       // When snapping, use the existing lanelet's centerpoint as the start
       // so the centerline is truly axis-aligned with the adopted corners.
@@ -391,7 +411,8 @@ function Scene({
       registryRef.current,
       laneletsRef.current,
       p,
-      endSnapThreshold
+      endSnapThreshold,
+      newSubType,
     );
 
     const bbox = geometry?.boundingBox;
@@ -416,8 +437,8 @@ function Scene({
       attachDistance: ATTACH_DISTANCE,
       startOverride: pendingStartSnap ?? undefined,
       endOverride:   endSnap ?? undefined,
-      // Tool chooses the kind of lanelet being drawn.
-      subType: tool === "crosswalk" ? "crosswalk" : "road",
+      subType: newSubType,
+      reservedNodeIds,
     });
 
     onFinishLanelet(reg, lanelet);
@@ -486,6 +507,7 @@ function Scene({
           cropRegion={cropRegion}
           zCeiling={zCeiling}
           floorY={geometry.boundingBox.min.y - 0.02}
+          showCap={showCropCap}
         />
       )}
 
@@ -520,6 +542,10 @@ interface CropBoxProps {
   cropRegion: CropRegion;
   zCeiling:   number;
   floorY:     number;
+  /** When false, the translucent clip-plane fill is skipped — only the
+   *  yellow wireframe outline renders. Useful when the colored cap
+   *  obscures cloud detail the user wants to inspect. */
+  showCap?:   boolean;
 }
 
 /**
@@ -540,10 +566,17 @@ interface CropBoxProps {
  *   worldCorner(lx, lz)     = (cx, cz) + Rz(angle) · (lx, lz)
  * so what you see is what gets clipped.
  */
-function CropBox({ cropRegion, zCeiling, floorY }: CropBoxProps) {
+function CropBox({ cropRegion, zCeiling, floorY, showCap = true }: CropBoxProps) {
   const { cx, cz, halfW, halfL, angle, pitch, roll } = cropRegion;
 
-  const { geometry, centerY } = useMemo(() => {
+  // We build TWO geometries from the same 8 corner vertices:
+  //  - an edge wireframe (lineSegments) to show the crop volume
+  //  - a filled mesh of the top quad, so the user can actually see
+  //    the tilted clip plane and how it moves through the cloud
+  //    when they change yaw / pitch / roll. The 4-vertex mesh
+  //    re-uses only indices 4..7 of the corner array, which is why
+  //    we build a separate small BufferGeometry for it.
+  const { lineGeometry, capGeometry } = useMemo(() => {
     const cosA = Math.cos(angle);
     const sinA = Math.sin(angle);
     const slopeX = Math.tan(roll);
@@ -559,58 +592,281 @@ function CropBox({ cropRegion, zCeiling, floorY }: CropBoxProps) {
 
     // 8 vertices, floats packed xyz·8.
     const positions = new Float32Array(8 * 3);
-    let topYSum = 0;
     for (let i = 0; i < 4; i++) {
       const [lx, lz] = localCorners[i];
       const wx = cx + cosA * lx - sinA * lz;
       const wz = cz + sinA * lx + cosA * lz;
 
-      // Bottom vertex at floor.
       positions[i * 3]     = wx;
       positions[i * 3 + 1] = floorY;
       positions[i * 3 + 2] = wz;
 
-      // Top vertex on the tilted clip plane.
       const topY = zCeiling + slopeX * lx + slopeZ * lz;
       const ti = (i + 4) * 3;
       positions[ti]     = wx;
       positions[ti + 1] = topY;
       positions[ti + 2] = wz;
-      topYSum += topY;
     }
 
     const indices = new Uint16Array([
       0, 1, 1, 2, 2, 3, 3, 0,   // bottom edges
-      4, 5, 5, 6, 6, 7, 7, 4,   // top edges
+      4, 5, 5, 6, 6, 7, 7, 4,   // top edges (= the clip plane outline)
       0, 4, 1, 5, 2, 6, 3, 7,   // verticals
     ]);
 
-    const g = new THREE.BufferGeometry();
-    g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    g.setIndex(new THREE.BufferAttribute(indices, 1));
-    return { geometry: g, centerY: (topYSum / 4 + floorY) * 0.5 };
-  }, [cx, cz, halfW, halfL, angle, pitch, roll, zCeiling, floorY]);
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    lineGeo.setIndex(new THREE.BufferAttribute(indices, 1));
 
-  // Reference centerY so the linter knows it's used (it's useful for
-  // debugging/observability; kept off the render path intentionally).
-  void centerY;
+    // Clip-plane cap — a single quad using the 4 top corners. We pack
+    // just those four vertices (so no index remapping is needed) and
+    // draw two CCW triangles covering the rectangle.
+    const capPositions = new Float32Array(4 * 3);
+    for (let i = 0; i < 4; i++) {
+      capPositions[i * 3]     = positions[(i + 4) * 3];
+      capPositions[i * 3 + 1] = positions[(i + 4) * 3 + 1];
+      capPositions[i * 3 + 2] = positions[(i + 4) * 3 + 2];
+    }
+    const capIndices = new Uint16Array([0, 1, 2, 0, 2, 3]);
+    const capGeo = new THREE.BufferGeometry();
+    capGeo.setAttribute("position", new THREE.BufferAttribute(capPositions, 3));
+    capGeo.setIndex(new THREE.BufferAttribute(capIndices, 1));
+
+    return { lineGeometry: lineGeo, capGeometry: capGeo };
+  }, [cx, cz, halfW, halfL, angle, pitch, roll, zCeiling, floorY]);
 
   // Free GPU buffers when the component unmounts or geometry is
   // rebuilt — React's ref-cleanup runs before the next useMemo result
   // is committed, so this catches every rebuild.
-  useEffect(() => () => geometry.dispose(), [geometry]);
+  useEffect(() => {
+    return () => {
+      lineGeometry.dispose();
+      capGeometry.dispose();
+    };
+  }, [lineGeometry, capGeometry]);
 
   return (
-    <lineSegments renderOrder={9}>
-      <primitive object={geometry} attach="geometry" />
-      <lineBasicMaterial
-        color="#facc15"
-        transparent
-        opacity={0.9}
-        depthTest={false}
-        depthWrite={false}
+    <group>
+      {/* Filled top face — translucent amber so you can still see
+          through it to the cloud below, but obvious enough to read
+          at a glance where points are being clipped. Double-sided
+          so the camera orientation in 3D doesn't hide it. */}
+      {showCap && (
+        <mesh renderOrder={8}>
+          <primitive object={capGeometry} attach="geometry" />
+          <meshBasicMaterial
+            color="#facc15"
+            transparent
+            opacity={0.18}
+            side={THREE.DoubleSide}
+            depthTest={false}
+            depthWrite={false}
+          />
+        </mesh>
+      )}
+      {/* Edge wireframe — the full parallelepiped outline. */}
+      <lineSegments renderOrder={9}>
+        <primitive object={lineGeometry} attach="geometry" />
+        <lineBasicMaterial
+          color="#facc15"
+          transparent
+          opacity={0.9}
+          depthTest={false}
+          depthWrite={false}
+        />
+      </lineSegments>
+    </group>
+  );
+}
+
+/**
+ * Thin wrapper around `<input type="number">` that keeps its own
+ * string buffer so intermediate keystrokes (`-`, `1.`, empty) don't
+ * get clobbered by a round-trip through the numeric prop.
+ *
+ * Commits valid numbers to `onChange` immediately on every keystroke,
+ * but only clamps to [min, max] on blur — letting the user type a
+ * number that's temporarily below `min` (e.g. typing "3" before "30")
+ * without the field fighting them. If the blur value is not a number
+ * at all, the display re-syncs to the last committed `value`.
+ */
+function NumericInput({
+  value,
+  step,
+  min,
+  max,
+  onChange,
+  fmt = (v: number) => (Number.isInteger(v) ? String(v) : v.toFixed(2)),
+  className,
+  disabled,
+}: {
+  value: number;
+  step?: number;
+  min?: number;
+  max?: number;
+  onChange: (v: number) => void;
+  fmt?: (v: number) => string;
+  className?: string;
+  disabled?: boolean;
+}) {
+  const [text, setText] = useState(() => fmt(value));
+  useEffect(() => {
+    setText(fmt(value));
+  }, [value, fmt]);
+  return (
+    <input
+      type="number"
+      value={text}
+      step={step}
+      min={min}
+      max={max}
+      disabled={disabled}
+      onChange={(e) => {
+        setText(e.target.value);
+        const n = parseFloat(e.target.value);
+        if (!Number.isNaN(n)) onChange(n);
+      }}
+      onBlur={() => {
+        const n = parseFloat(text);
+        if (Number.isNaN(n)) {
+          setText(fmt(value));
+          return;
+        }
+        let clamped = n;
+        if (min !== undefined) clamped = Math.max(min, clamped);
+        if (max !== undefined) clamped = Math.min(max, clamped);
+        if (clamped !== n) {
+          onChange(clamped);
+          setText(fmt(clamped));
+        }
+      }}
+      className={className}
+    />
+  );
+}
+
+/**
+ * Slider + editable numeric input for a single angle (degrees in the
+ * UI, radians in state). Both controls write to the same `onChangeRad`
+ * so dragging the slider and typing a number stay in sync.
+ *
+ * Double-clicking the slider resets to 0° — cheap "snap to flat"
+ * without needing a per-field reset button.
+ */
+function AngleField({
+  label,
+  title,
+  icon,
+  min,
+  max,
+  step,
+  valueRad,
+  onChangeRad,
+}: {
+  label: string;
+  title: string;
+  icon: React.ReactNode;
+  min: number;
+  max: number;
+  step: number;
+  valueRad: number;
+  onChangeRad: (rad: number) => void;
+}) {
+  const DEG = (r: number) => (r * 180) / Math.PI;
+  const RAD = (d: number) => (d * Math.PI) / 180;
+  // The text input carries its own string state so intermediate
+  // keystrokes like "-" or "1." are not clobbered by the radian
+  // round-trip. It re-syncs whenever the external radian value
+  // changes (e.g. slider drag, Reset button).
+  const [text, setText] = useState(() => DEG(valueRad).toFixed(1));
+  useEffect(() => {
+    setText(DEG(valueRad).toFixed(1));
+  }, [valueRad]);
+
+  return (
+    <div className="flex items-center gap-1.5" title={title}>
+      <svg className="w-3 h-3 text-white/40" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+        {icon}
+      </svg>
+      <span className="text-[10px] font-mono text-white/40">{label}</span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={Number(DEG(valueRad).toFixed(1))}
+        onChange={(e) => onChangeRad(RAD(parseFloat(e.target.value)))}
+        onDoubleClick={() => onChangeRad(0)}
+        className="w-24 accent-amber-300 cursor-pointer"
       />
-    </lineSegments>
+      <input
+        type="number"
+        value={text}
+        step={step}
+        onChange={(e) => {
+          setText(e.target.value);
+          const n = parseFloat(e.target.value);
+          if (!Number.isNaN(n)) onChangeRad(RAD(n));
+        }}
+        onBlur={() => {
+          const n = parseFloat(text);
+          if (Number.isNaN(n)) setText(DEG(valueRad).toFixed(1));
+        }}
+        className="w-14 bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] font-mono text-amber-200/90 text-right focus:outline-none focus:border-amber-300/60"
+      />
+      <span className="text-[10px] font-mono text-white/40">°</span>
+    </div>
+  );
+}
+
+/**
+ * Slider + numeric input pair for the crop-region scalar fields
+ * (center X, center Z, width, length). Shares the same state
+ * between both controls via `value` / `onChange`, so dragging and
+ * typing are interchangeable.
+ */
+function CropScalarField({
+  label,
+  unit,
+  min,
+  max,
+  step,
+  value,
+  onChange,
+  fmt,
+}: {
+  label: string;
+  unit?: string;
+  min: number;
+  max: number;
+  step: number;
+  value: number;
+  onChange: (v: number) => void;
+  fmt: (v: number) => string;
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="text-[10px] font-mono text-white/40">{label}</span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="w-20 accent-amber-300 cursor-pointer"
+      />
+      <NumericInput
+        value={value}
+        step={step}
+        min={min}
+        max={max}
+        onChange={onChange}
+        fmt={fmt}
+        className="w-14 bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] font-mono text-amber-200/90 text-right focus:outline-none focus:border-amber-300/60"
+      />
+      {unit && <span className="text-[10px] font-mono text-white/40">{unit}</span>}
+    </div>
   );
 }
 
@@ -697,6 +953,10 @@ export function SceneViewer({
     pitch:   0,
     roll:    0,
   });
+  // Independent of the crop volume itself — whether the tilted top
+  // face of the crop box renders as a translucent colored quad.
+  // Wireframe always stays on; this just toggles the fill.
+  const [showCropCap, setShowCropCap] = useState(true);
 
   // Reset crop center to the cloud's footprint centroid whenever a new
   // cloud is loaded — the old center would almost certainly sit outside
@@ -800,6 +1060,81 @@ export function SceneViewer({
   // --------------------------------------------------------------------
   const deselectAll = () => setSelectedIds(new Set());
 
+  // ─── Clipboard for Ctrl/Cmd + C / V on lanelets ──────────────
+  //
+  // The clipboard holds a self-contained snapshot: every NodeId
+  // referenced by the copied lanelets has its position recorded,
+  // keyed by the ORIGINAL NodeId. On paste we allocate a fresh
+  // NodeId per original and rewrite the boundary arrays to use
+  // the new IDs. Because shared NodeIds in the original group
+  // map through the same entry in `idMap`, a copied pair of
+  // connected lanelets stays connected in the paste — but never
+  // attaches back to the source lanelets (no existing registry
+  // IDs are reused).
+  interface LaneletClipboard {
+    lanelets: Omit<Lanelet, "id">[];
+    nodes:    Record<NodeId, Vec3>;
+  }
+  const clipboardRef = useRef<LaneletClipboard | null>(null);
+
+  const copySelectedLanelets = () => {
+    if (selectedIds.size === 0) return;
+    const selected: Lanelet[] = lanelets.filter((l) => selectedIds.has(l.id));
+    if (selected.length === 0) return;
+
+    const nodes: Record<NodeId, Vec3> = {};
+    for (const l of selected) {
+      for (const id of l.leftBoundary)  nodes[id] = getNode(registry, id);
+      for (const id of l.rightBoundary) nodes[id] = getNode(registry, id);
+    }
+
+    // Drop the id and snapshot the boundaries so future edits to
+    // the source lanelets don't mutate what's on the clipboard.
+    const lanSnap: Omit<Lanelet, "id">[] = selected.map((l) => {
+      const { id: _id, leftBoundary, rightBoundary, ...rest } = l;
+      void _id;
+      return {
+        ...rest,
+        leftBoundary:  [...leftBoundary],
+        rightBoundary: [...rightBoundary],
+      };
+    });
+    clipboardRef.current = { lanelets: lanSnap, nodes };
+  };
+
+  const pasteClipboard = () => {
+    const clip = clipboardRef.current;
+    if (!clip || clip.lanelets.length === 0) return;
+
+    // Offset XZ so the paste doesn't overlap the source. Scale with
+    // the scene size when known so huge maps don't end up with a
+    // 3m nudge you can barely see, while small test scenes don't
+    // get a 50m nudge off the cloud.
+    const spanHint = geometry?.boundingSphere?.radius ?? 0;
+    const OFF = Math.max(3, Math.min(12, spanHint * 0.02));
+
+    let reg = registry;
+    const idMap = new Map<NodeId, NodeId>();
+    for (const [oldIdStr, pos] of Object.entries(clip.nodes)) {
+      const oldId = Number(oldIdStr);
+      const newPos: Vec3 = [pos[0] + OFF, pos[1], pos[2] + OFF];
+      const { reg: reg2, id: newId } = addNode(reg, newPos, nextNodeIdRef);
+      reg = reg2;
+      idMap.set(oldId, newId);
+    }
+
+    const newLanelets: Lanelet[] = clip.lanelets.map((l) => ({
+      ...l,
+      id: nextLaneletIdRef.current++,
+      leftBoundary:  l.leftBoundary.map((id)  => idMap.get(id) ?? id),
+      rightBoundary: l.rightBoundary.map((id) => idMap.get(id) ?? id),
+    }));
+
+    setRegistry(reg);
+    setLanelets((ls) => [...ls, ...newLanelets]);
+    setSelectedIds(new Set(newLanelets.map((l) => l.id)));
+  };
+
   const handleSelect = (id: number, shiftKey: boolean) => {
     setSelectedIds((prev) => {
       if (shiftKey) {
@@ -873,6 +1208,29 @@ export function SceneViewer({
     );
   };
 
+  // Toggle "rect lock" on a selection. Turning it ON also collapses
+  // any existing curvature onto the straight start→end axis immediately
+  // so the UI reflects the locked shape without waiting for a drag.
+  // Turning it OFF just clears the flag — the current geometry stays.
+  const setStraightIds = (ids: number[], straight: boolean) => {
+    const idSet = new Set(ids);
+    if (!straight) {
+      setLanelets((ls) =>
+        ls.map((l) => (idSet.has(l.id) ? { ...l, straight: false } : l))
+      );
+      return;
+    }
+    let nextReg = registry;
+    const nextLanelets = lanelets.map((l) => {
+      if (!idSet.has(l.id)) return l;
+      const { reg } = straightenLanelet(nextReg, l);
+      nextReg = reg;
+      return { ...l, straight: true };
+    });
+    setRegistry(nextReg);
+    setLanelets(nextLanelets);
+  };
+
   const duplicateNeighbor = (sourceId: number, side: "left" | "right") => {
     const src = lanelets.find((l) => l.id === sourceId);
     if (!src) return;
@@ -944,12 +1302,23 @@ export function SceneViewer({
           e.preventDefault();
           deleteIds(Array.from(selectedIds));
         }
+      } else if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey) {
+        // Copy / paste. Lower-case check covers both "c" / "v" (the
+        // plain key) and works uniformly across modifiers.
+        const k = e.key.toLowerCase();
+        if (k === "c" && selectedIds.size > 0) {
+          e.preventDefault();
+          copySelectedLanelets();
+        } else if (k === "v" && clipboardRef.current) {
+          e.preventDefault();
+          pasteClipboard();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pendingStart, selectedIds, tool]);
+  }, [pendingStart, selectedIds, tool, lanelets, registry]);
 
   /**
    * Toolbar button behaviour: clicking the same tool that's already active
@@ -1031,6 +1400,7 @@ export function SceneViewer({
           tool={tool}
           width={width}
           cropRegion={cropRegion}
+          showCropCap={showCropCap}
           onPickCropCenter={handlePickCropCenter}
           registry={registry}
           nextNodeIdRef={nextNodeIdRef}
@@ -1153,6 +1523,7 @@ export function SceneViewer({
         onDeselectAll={deselectAll}
         onDuplicateNeighbor={duplicateNeighbor}
         onCreateJoint={createJoint}
+        onSetStraight={setStraightIds}
       />
 
       {/* ── Tool panel ──────────────────────────────────────── */}
@@ -1198,9 +1569,20 @@ export function SceneViewer({
         </button>
 
         <div className="flex flex-col gap-1.5 pt-1">
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-2">
             <span className="text-[10px] font-mono text-white/40 uppercase tracking-wider">Width</span>
-            <span className="text-xs font-mono text-white/70">{width.toFixed(1)} m</span>
+            <div className="flex items-center gap-1">
+              <NumericInput
+                value={width}
+                step={0.1}
+                min={0.5}
+                max={10}
+                onChange={setWidth}
+                fmt={(v) => v.toFixed(1)}
+                className="w-14 bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[11px] font-mono text-white/80 text-right focus:outline-none focus:border-cyan-400/50"
+              />
+              <span className="text-[10px] font-mono text-white/40">m</span>
+            </div>
           </div>
           <input
             type="range"
@@ -1271,6 +1653,31 @@ export function SceneViewer({
 
             <div className="w-px h-5 bg-white/10" />
 
+            {/* Toggle the translucent amber fill on the clip plane.
+                The wireframe stays visible either way — this just
+                hides the colored face for users who want an
+                uncluttered view of the points being clipped. */}
+            <button
+              onClick={() => setShowCropCap((v) => !v)}
+              title={showCropCap ? "Hide colored clip face" : "Show colored clip face"}
+              className={`flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded-md border transition-colors cursor-pointer
+                ${showCropCap
+                  ? "bg-amber-400/20 border-amber-300/50 text-amber-100"
+                  : "bg-white/5 border-white/10 text-white/60 hover:text-white hover:bg-white/10"}`}
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                {showCropCap ? (
+                  <>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+                  </>
+                ) : (
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3.98 8.223A10.477 10.477 0 0 0 1.934 12c1.292 4.338 5.31 7.5 10.066 7.5.993 0 1.953-.138 2.863-.395M6.228 6.228A10.451 10.451 0 0 1 12 4.5c4.756 0 8.773 3.162 10.065 7.498a10.522 10.522 0 0 1-4.293 5.774M6.228 6.228 3 3m3.228 3.228 3.65 3.65m7.894 7.894L21 21m-3.228-3.228-3.65-3.65m0 0a3 3 0 1 0-4.243-4.243m4.242 4.242L9.88 9.88" />
+                )}
+              </svg>
+              {showCropCap ? "Face on" : "Face off"}
+            </button>
+
             <button
               onClick={() => setTool(tool === "crop-center" ? "view" : "crop-center")}
               className={`flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 rounded-md border transition-colors cursor-pointer
@@ -1306,79 +1713,63 @@ export function SceneViewer({
 
             <div className="w-px h-5 bg-white/10" />
 
-            {/* Center X */}
-            <div className="flex items-center gap-1.5">
-              <span className="text-[10px] font-mono text-white/40">X</span>
-              <input
-                type="range"
-                min={xMin}
-                max={xMax}
-                step={xzStep}
-                value={crop.cx}
-                onChange={(e) => setCrop((c) => ({ ...c, cx: parseFloat(e.target.value) }))}
-                className="w-20 accent-amber-300 cursor-pointer"
-              />
-              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">{crop.cx.toFixed(1)}</span>
-            </div>
+            {/* Each of X / Z / W / L has a slider for quick drags
+                and a numeric input right next to it for typing an
+                exact value. Both write to the same piece of state
+                so the two controls stay in lock-step. */}
+            <CropScalarField
+              label="X"
+              min={xMin} max={xMax} step={xzStep}
+              value={crop.cx}
+              onChange={(v) => setCrop((c) => ({ ...c, cx: v }))}
+              fmt={(v) => v.toFixed(1)}
+            />
 
             {/* Center Z (ground-plane second axis; label as "Z" to match
                 Three.js world coords). */}
-            <div className="flex items-center gap-1.5">
-              <span className="text-[10px] font-mono text-white/40">Z</span>
-              <input
-                type="range"
-                min={zMin}
-                max={zMax}
-                step={xzStep}
-                value={crop.cz}
-                onChange={(e) => setCrop((c) => ({ ...c, cz: parseFloat(e.target.value) }))}
-                className="w-20 accent-amber-300 cursor-pointer"
-              />
-              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">{crop.cz.toFixed(1)}</span>
-            </div>
+            <CropScalarField
+              label="Z"
+              min={zMin} max={zMax} step={xzStep}
+              value={crop.cz}
+              onChange={(v) => setCrop((c) => ({ ...c, cz: v }))}
+              fmt={(v) => v.toFixed(1)}
+            />
 
             <div className="w-px h-5 bg-white/10" />
 
             {/* Rectangle width (local X) */}
-            <div className="flex items-center gap-1.5">
-              <span className="text-[10px] font-mono text-white/40">W</span>
-              <input
-                type="range"
-                min={WL_MIN}
-                max={WL_MAX}
-                step={WL_STEP}
-                value={crop.width}
-                onChange={(e) => setCrop((c) => ({ ...c, width: parseFloat(e.target.value) }))}
-                className="w-20 accent-amber-300 cursor-pointer"
-              />
-              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">{crop.width.toFixed(1)}m</span>
-            </div>
+            <CropScalarField
+              label="W"
+              unit="m"
+              min={WL_MIN} max={WL_MAX} step={WL_STEP}
+              value={crop.width}
+              onChange={(v) => setCrop((c) => ({ ...c, width: v }))}
+              fmt={(v) => v.toFixed(1)}
+            />
 
             {/* Rectangle length (local Z) */}
-            <div className="flex items-center gap-1.5">
-              <span className="text-[10px] font-mono text-white/40">L</span>
-              <input
-                type="range"
-                min={WL_MIN}
-                max={WL_MAX}
-                step={WL_STEP}
-                value={crop.length}
-                onChange={(e) => setCrop((c) => ({ ...c, length: parseFloat(e.target.value) }))}
-                className="w-20 accent-amber-300 cursor-pointer"
-              />
-              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">{crop.length.toFixed(1)}m</span>
-            </div>
+            <CropScalarField
+              label="L"
+              unit="m"
+              min={WL_MIN} max={WL_MAX} step={WL_STEP}
+              value={crop.length}
+              onChange={(v) => setCrop((c) => ({ ...c, length: v }))}
+              fmt={(v) => v.toFixed(1)}
+            />
           </div>
 
-          {/* ── Row 2: clip-plane tilt (pitch / roll) ─────────── */}
+          {/* ── Row 2: clip-plane angles (yaw / pitch / roll) ───
+              Each angle has both a slider (for dragging) and a text
+              input (for punching in an exact value). Editing either
+              immediately writes back to the same state. */}
           <div className="flex items-center gap-3 pl-[110px]">
-            <span className="text-[9px] font-mono uppercase tracking-wider text-amber-200/60">Tilt</span>
+            <span className="text-[9px] font-mono uppercase tracking-wider text-amber-200/60">Angle</span>
 
             <button
               onClick={() =>
-                setCrop((c) => ({ ...c, pitch: 0, roll: 0 }))
+                setCrop((c) => ({ ...c, angle: 0, pitch: 0, roll: 0 }))
               }
-              title="Reset tilt"
+              title="Reset yaw · pitch · roll"
               className="text-[10px] font-mono px-2 py-0.5 rounded border bg-white/5 border-white/10 text-white/60 hover:text-white hover:bg-white/10 cursor-pointer"
             >
               Reset
@@ -1386,62 +1777,58 @@ export function SceneViewer({
 
             <div className="w-px h-5 bg-white/10" />
 
+            {/* Yaw — spin the rectangle around world +Y. Lets the
+                user line the crop axis up with a diagonal road. */}
+            <AngleField
+              label="Yaw"
+              title="Yaw · rotate rectangle around vertical axis"
+              icon={
+                <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M4 12a8 8 0 1 0 16 0M4 12l3-3M4 12l3 3" />
+              }
+              min={-180}
+              max={180}
+              step={0.5}
+              valueRad={crop.angle}
+              onChangeRad={(rad) => setCrop((c) => ({ ...c, angle: rad }))}
+            />
+
             {/* Pitch — tilt the clip plane along the rectangle's length.
                 Positive = plane rises toward local +Z (street going
                 uphill along its length). Shader clamps to ±85°. */}
-            <div className="flex items-center gap-1.5" title="Pitch · tilt clip plane along length (street uphill)">
-              <svg className="w-3 h-3 text-white/40" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3 17 L21 7" />
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3 17 L21 17" strokeDasharray="2 2" opacity="0.5" />
-              </svg>
-              <span className="text-[10px] font-mono text-white/40">Pitch</span>
-              <input
-                type="range"
-                min={-60}
-                max={60}
-                step={0.5}
-                value={Number(((crop.pitch * 180) / Math.PI).toFixed(1))}
-                onChange={(e) =>
-                  setCrop((c) => ({
-                    ...c,
-                    pitch: (parseFloat(e.target.value) * Math.PI) / 180,
-                  }))
-                }
-                onDoubleClick={() => setCrop((c) => ({ ...c, pitch: 0 }))}
-                className="w-24 accent-amber-300 cursor-pointer"
-              />
-              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">
-                {((crop.pitch * 180) / Math.PI).toFixed(1)}°
-              </span>
-            </div>
+            <AngleField
+              label="Pitch"
+              title="Pitch · tilt clip plane along length (street uphill)"
+              icon={
+                <>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 17 L21 7" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 17 L21 17" strokeDasharray="2 2" opacity="0.5" />
+                </>
+              }
+              min={-60}
+              max={60}
+              step={0.5}
+              valueRad={crop.pitch}
+              onChangeRad={(rad) => setCrop((c) => ({ ...c, pitch: rad }))}
+            />
 
             {/* Roll — tilt the clip plane across the rectangle's width.
                 Positive = plane rises toward local +X (road camber). */}
-            <div className="flex items-center gap-1.5" title="Roll · tilt clip plane across width (camber)">
-              <svg className="w-3 h-3 text-white/40" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M21 17 L3 7" />
-                <path strokeLinecap="round" strokeLinejoin="round" d="M3 17 L21 17" strokeDasharray="2 2" opacity="0.5" />
-              </svg>
-              <span className="text-[10px] font-mono text-white/40">Roll</span>
-              <input
-                type="range"
-                min={-60}
-                max={60}
-                step={0.5}
-                value={Number(((crop.roll * 180) / Math.PI).toFixed(1))}
-                onChange={(e) =>
-                  setCrop((c) => ({
-                    ...c,
-                    roll: (parseFloat(e.target.value) * Math.PI) / 180,
-                  }))
-                }
-                onDoubleClick={() => setCrop((c) => ({ ...c, roll: 0 }))}
-                className="w-24 accent-amber-300 cursor-pointer"
-              />
-              <span className="text-[10px] font-mono text-amber-200/80 w-10 text-right">
-                {((crop.roll * 180) / Math.PI).toFixed(1)}°
-              </span>
-            </div>
+            <AngleField
+              label="Roll"
+              title="Roll · tilt clip plane across width (camber)"
+              icon={
+                <>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 17 L3 7" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 17 L21 17" strokeDasharray="2 2" opacity="0.5" />
+                </>
+              }
+              min={-60}
+              max={60}
+              step={0.5}
+              valueRad={crop.roll}
+              onChangeRad={(rad) => setCrop((c) => ({ ...c, roll: rad }))}
+            />
           </div>
         </div>
       )}
@@ -1509,9 +1896,20 @@ export function SceneViewer({
             disabled={!bbox}
             className="w-24 accent-cyan-400 cursor-pointer disabled:opacity-40"
           />
-          <span className={`text-xs font-mono w-14 ${zCeiling < yMax ? "text-cyan-400" : "text-white/30"}`}>
-            {bbox ? `${zCeiling.toFixed(2)} m` : "—"}
-          </span>
+          <NumericInput
+            value={zCeiling}
+            step={yStep}
+            min={yMin}
+            max={yMax}
+            onChange={setZCeiling}
+            disabled={!bbox}
+            fmt={(v) => v.toFixed(2)}
+            className={`w-16 bg-white/5 border rounded px-1.5 py-0.5 text-[11px] font-mono text-right focus:outline-none disabled:opacity-40
+              ${zCeiling < yMax
+                ? "border-cyan-400/40 text-cyan-300 focus:border-cyan-300"
+                : "border-white/10 text-white/40 focus:border-white/30"}`}
+          />
+          <span className="text-[10px] font-mono text-white/40">m</span>
           <button
             onClick={() => setCrop((c) => ({ ...c, enabled: !c.enabled }))}
             disabled={!bbox}

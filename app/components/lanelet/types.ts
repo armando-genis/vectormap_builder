@@ -95,6 +95,16 @@ export interface Lanelet {
    */
   leftBoundarySubType?:  LineSubType;
   rightBoundarySubType?: LineSubType;
+
+  /**
+   * "Rect lock": when true, the lanelet is constrained to a straight
+   * rectangle. Only the endpoint drag handles are active and interior
+   * control points are re-distributed onto the start→end line after
+   * every endpoint move, so the shape can only grow / shrink along
+   * its axis. Default (undefined/false) keeps the standard
+   * curve-capable editing behaviour.
+   */
+  straight?: boolean;
 }
 
 /**

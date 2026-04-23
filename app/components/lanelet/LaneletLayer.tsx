@@ -383,22 +383,30 @@ function LaneletMesh({
         </>
       )}
 
-      {showHandles && centerline.map((pos, i) => (
-        <LaneletHandle
-          key={i}
-          pos={pos}
-          active={
-            activeDragHandle?.kind === "node" &&
-            activeDragHandle.id === lanelet.id &&
-            activeDragHandle.index === i
-          }
-          /* Endpoints (first/last) get the cyan palette; interior shape
-             controls are a slightly different pink so they're easier to
-             tell apart visually. */
-          interior={i !== 0 && i !== n - 1}
-          onPointerDown={() => onHandlePointerDown(lanelet.id, i)}
-        />
-      ))}
+      {showHandles && centerline.map((pos, i) => {
+        const isInterior = i !== 0 && i !== n - 1;
+        // Rect-locked lanelets expose only their endpoints — hiding
+        // interior handles makes the "length only" contract visible
+        // and prevents the user from trying to curve a shape that
+        // would snap back on the next endpoint drag anyway.
+        if (lanelet.straight && isInterior) return null;
+        return (
+          <LaneletHandle
+            key={i}
+            pos={pos}
+            active={
+              activeDragHandle?.kind === "node" &&
+              activeDragHandle.id === lanelet.id &&
+              activeDragHandle.index === i
+            }
+            /* Endpoints (first/last) get the cyan palette; interior shape
+               controls are a slightly different pink so they're easier to
+               tell apart visually. */
+            interior={isInterior}
+            onPointerDown={() => onHandlePointerDown(lanelet.id, i)}
+          />
+        );
+      })}
 
       {showHandles && (
         <MoveHandle

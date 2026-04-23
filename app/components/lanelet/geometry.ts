@@ -29,6 +29,29 @@ import {
 import type { LaneletEndSnap } from "./registry";
 
 // ---------------------------------------------------------------------------
+// Subtype helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Collect every NodeId owned by a lanelet whose subType differs from
+ * `keepSubType`. Used by creation flows to prevent cross-type attach
+ * (e.g. a crosswalk accidentally latching onto a road boundary node
+ * it happens to be within the snap threshold of).
+ */
+export function collectNodeIdsOfOtherSubType(
+  lanelets: readonly Lanelet[],
+  keepSubType: LaneletSubType,
+): Set<NodeId> {
+  const out = new Set<NodeId>();
+  for (const l of lanelets) {
+    if (l.subType === keepSubType) continue;
+    for (const id of l.leftBoundary)  out.add(id);
+    for (const id of l.rightBoundary) out.add(id);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Pure geometry helpers
 // ---------------------------------------------------------------------------
 
@@ -129,6 +152,14 @@ export interface CreateLaneletParams {
    * visualisation (zebra stripes, no direction arrow) downstream.
    */
   subType?: LaneletSubType;
+  /**
+   * NodeIds the attach logic should NOT consider when placing endpoint
+   * corners. The main use case is keeping crosswalks from latching
+   * onto road boundary nodes (and vice-versa): pass in every NodeId
+   * owned by lanelets of the *other* subType and they become invisible
+   * to `placeCorner`'s nearest-node search.
+   */
+  reservedNodeIds?: ReadonlySet<NodeId>;
 }
 
 /**
@@ -158,6 +189,7 @@ export function createLanelet(
     interiorCount = 2,
     interiorCenters,
     subType = "road",
+    reservedNodeIds,
   } = params;
 
   // Axis: when an end is overridden we snap the relevant endpoint to the
@@ -207,7 +239,14 @@ export function createLanelet(
   // Allocate / attach NodeIds. placeCorner for endpoints (attach allowed
   // → picks up nearby existing nodes), addNode for interior (always fresh
   // to avoid surprise junctions at midpoints).
+  // `taken` is passed to placeCorner as its exclusion set so the same
+  // node can't be picked twice for this lanelet. We pre-seed it with
+  // `reservedNodeIds` (e.g. nodes owned by lanelets of a different
+  // subType) so cross-type attach never happens.
   const taken = new Set<NodeId>();
+  if (reservedNodeIds) {
+    for (const id of reservedNodeIds) taken.add(id);
+  }
   let reg = reg0;
 
   const place = (pos: Vec3): NodeId => {
@@ -269,6 +308,68 @@ export function createLanelet(
 }
 
 // ---------------------------------------------------------------------------
+// Editing: enforce rectangular shape
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-lay every interior boundary node of `lanelet` onto the straight
+ * line between its current start and end centers, keeping each pair
+ * perpendicular to that axis at half-width apart.
+ *
+ * This is the one-shot straightener used both when the user toggles
+ * `straight` on in the Properties panel and as a post-step after
+ * endpoint drags on already-straight lanelets (so the shape can't
+ * drift away from rectangular).
+ *
+ * Endpoint NodeIds are NEVER touched — they may be shared with
+ * neighboring lanelets and moving them would yank those neighbors.
+ * Interior NodeIds are always allocated fresh by `createLanelet`, so
+ * repositioning them is always safe.
+ */
+export function straightenLanelet(
+  reg: NodeRegistry,
+  lanelet: Lanelet
+): { reg: NodeRegistry; lanelet: Lanelet } {
+  const n = lanelet.leftBoundary.length;
+  if (n <= 2) return { reg, lanelet };
+
+  const ls = getNode(reg, lanelet.leftBoundary[0]);
+  const rs = getNode(reg, lanelet.rightBoundary[0]);
+  const le = getNode(reg, lanelet.leftBoundary[n - 1]);
+  const re = getNode(reg, lanelet.rightBoundary[n - 1]);
+
+  const cs: Vec3 = [(ls[0] + rs[0]) * 0.5, (ls[1] + rs[1]) * 0.5, (ls[2] + rs[2]) * 0.5];
+  const ce: Vec3 = [(le[0] + re[0]) * 0.5, (le[1] + re[1]) * 0.5, (le[2] + re[2]) * 0.5];
+
+  // Use the current endpoint widths (they can legitimately differ if
+  // the user widened only one end previously). Interior pairs get a
+  // linearly interpolated width per index.
+  const widthXZ = (l: Vec3, r: Vec3) =>
+    Math.hypot(l[0] - r[0], l[2] - r[2]);
+  const wStart = widthXZ(ls, rs);
+  const wEnd   = widthXZ(le, re);
+
+  const [lpx, lpz] = leftPerpXZ(cs, ce);
+  if (lpx === 0 && lpz === 0) {
+    // Start ≈ end, nothing meaningful to straighten.
+    return { reg, lanelet };
+  }
+
+  const updates: Record<NodeId, Vec3> = {};
+  for (let i = 1; i < n - 1; i++) {
+    const t = i / (n - 1);
+    const cx = cs[0] + (ce[0] - cs[0]) * t;
+    const cy = cs[1] + (ce[1] - cs[1]) * t;
+    const cz = cs[2] + (ce[2] - cs[2]) * t;
+    const half = (wStart + (wEnd - wStart) * t) * 0.5;
+    updates[lanelet.leftBoundary[i]]  = [cx + lpx * half, cy, cz + lpz * half];
+    updates[lanelet.rightBoundary[i]] = [cx - lpx * half, cy, cz - lpz * half];
+  }
+
+  return { reg: moveNodes(reg, updates), lanelet };
+}
+
+// ---------------------------------------------------------------------------
 // Editing: move a centerline node at index i
 // ---------------------------------------------------------------------------
 
@@ -313,6 +414,26 @@ export function moveLaneletNodeAtIndex(
   const rightOld = getNode(reg, rightId);
 
   const isInterior = index > 0 && index < n - 1;
+
+  // Rect lock: interior handles are disabled, endpoint drags translate
+  // the endpoint and then re-distribute every interior pair onto the
+  // straight start→end axis so the shape remains a clean rectangle.
+  if (lanelet.straight) {
+    if (isInterior) {
+      return { reg, lanelet };
+    }
+    const oldCx = (leftOld[0]  + rightOld[0])  * 0.5;
+    const oldCy = (leftOld[1]  + rightOld[1])  * 0.5;
+    const oldCz = (leftOld[2]  + rightOld[2])  * 0.5;
+    const dx = newCenter[0] - oldCx;
+    const dy = newCenter[1] - oldCy;
+    const dz = newCenter[2] - oldCz;
+    const regMoved = moveNodes(reg, {
+      [leftId]:  [leftOld[0]  + dx, leftOld[1]  + dy, leftOld[2]  + dz],
+      [rightId]: [rightOld[0] + dx, rightOld[1] + dy, rightOld[2] + dz],
+    });
+    return straightenLanelet(regMoved, lanelet);
+  }
 
   if (isInterior) {
     // Local centerline tangent from the immediate neighbors in XZ.

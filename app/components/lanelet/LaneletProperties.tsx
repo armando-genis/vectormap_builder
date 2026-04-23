@@ -16,6 +16,11 @@ interface LaneletPropertiesProps {
   onDuplicateNeighbor: (sourceId: number, side: "left" | "right") => void;
   /** Create a connector lanelet from `fromId`'s end to `toId`'s start. */
   onCreateJoint: (fromId: number, toId: number, type: JointType) => void;
+  /**
+   * Toggle "rect lock" on the given lanelets. On true, interior control
+   * points are snapped onto the straight start→end axis and stay there.
+   */
+  onSetStraight: (ids: number[], straight: boolean) => void;
 }
 
 export function LaneletProperties({
@@ -28,6 +33,7 @@ export function LaneletProperties({
   onDeselectAll,
   onDuplicateNeighbor,
   onCreateJoint,
+  onSetStraight,
 }: LaneletPropertiesProps) {
   // Joint panel local state — target lanelet id and turn type.
   // Hooks must run unconditionally, so declare them before the early
@@ -62,6 +68,7 @@ export function LaneletProperties({
   const sub   = common("subType");
   const turn  = common("turnDirection");
   const speed = common("speedLimit");
+  const straight = common("straight");
 
   // Turn direction and joints don't apply to crosswalks — they're a
   // crossing area, not a directional travel lane. Hide those UI bits when
@@ -92,7 +99,10 @@ export function LaneletProperties({
         </button>
       </div>
 
-      {/* ── Width ─────────────────────────────────────────── */}
+      {/* ── Width ───────────────────────────────────────────
+          Slider for dragging + numeric input for typing an exact
+          value. Both hit the same onResizeWidth handler so the two
+          controls stay in sync. */}
       <FieldRow label="Width">
         <input
           type="range"
@@ -101,11 +111,13 @@ export function LaneletProperties({
           step={0.1}
           value={width === "__mixed__" ? 3 : (width as number)}
           onChange={(e) => onResizeWidth(ids, parseFloat(e.target.value))}
-          className="w-full accent-cyan-400 cursor-pointer"
+          className="flex-1 accent-cyan-400 cursor-pointer"
         />
-        <span className="text-xs font-mono text-white/70 w-12 text-right">
-          {width === "__mixed__" ? "—" : `${(width as number).toFixed(1)} m`}
-        </span>
+        <WidthNumberInput
+          value={width === "__mixed__" ? null : (width as number)}
+          onChange={(v) => onResizeWidth(ids, v)}
+        />
+        <span className="text-[10px] font-mono text-white/40">m</span>
       </FieldRow>
 
       {/* Type is chosen by the drawing tool (Lanelet / Crosswalk buttons),
@@ -162,6 +174,45 @@ export function LaneletProperties({
           className="w-full bg-white/5 border border-white/10 rounded-md px-2 py-1 text-xs font-mono text-white/80 focus:outline-none focus:border-cyan-400/50"
         />
         <span className="text-[10px] font-mono text-white/40 w-8">km/h</span>
+      </FieldRow>
+
+      {/* ── Rect lock ────────────────────────────────────── */}
+      {/* Available for both roads and crosswalks — a rectangular
+          crosswalk with only length-draggable ends is useful too. */}
+      <FieldRow label="Shape">
+        <button
+          onClick={() => {
+            const next = straight === "__mixed__" ? true : !(straight as boolean | undefined);
+            onSetStraight(ids, next);
+          }}
+          className={
+            "flex-1 flex items-center justify-between gap-2 px-2 py-1.5 rounded-md text-[11px] font-mono border transition-colors cursor-pointer " +
+            (straight === true
+              ? "border-amber-400/40 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25"
+              : "border-white/10 bg-white/5 text-white/60 hover:bg-white/10 hover:text-white/90")
+          }
+          title={
+            straight === true
+              ? "Rect lock ON — interior handles disabled, only endpoints move (click to unlock)"
+              : "Rect lock OFF — drag interior handles to curve (click to lock as straight)"
+          }
+        >
+          <span className="flex items-center gap-1.5">
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              {straight === true ? (
+                <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+              ) : (
+                <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M13.5 10.5V6.75a4.5 4.5 0 1 1 9 0v3.75M3.75 21.75h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H3.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+              )}
+            </svg>
+            {straight === "__mixed__" ? "Mixed" : straight === true ? "Rect lock" : "Curve"}
+          </span>
+          <span className="text-[9px] text-white/40">
+            {straight === true ? "ends only" : "all handles"}
+          </span>
+        </button>
       </FieldRow>
 
       {/* ── Add neighbor (single road lanelet only) ─────── */}
@@ -331,5 +382,60 @@ function FieldRow({
       </span>
       <div className="flex-1 flex items-center gap-2">{children}</div>
     </div>
+  );
+}
+
+/**
+ * Editable numeric input for the lanelet width. Mirrors the slider
+ * value but keeps its own string buffer so typing intermediate
+ * characters (empty, `.`, `0.`) doesn't get stomped on by a
+ * round-trip through the `value` prop.
+ *
+ * Commits valid numbers on every keystroke, clamps to [0.5, 10] on
+ * blur, and shows an em-dash placeholder when the selection is mixed
+ * (null `value`) so users know they're editing a collective width.
+ */
+function WidthNumberInput({
+  value,
+  onChange,
+}: {
+  value: number | null;
+  onChange: (v: number) => void;
+}) {
+  const MIN = 0.5;
+  const MAX = 10;
+  const fmt = (v: number) => v.toFixed(1);
+  const [text, setText] = useState(() => (value === null ? "" : fmt(value)));
+  useEffect(() => {
+    setText(value === null ? "" : fmt(value));
+  }, [value]);
+
+  return (
+    <input
+      type="number"
+      placeholder="—"
+      step={0.1}
+      min={MIN}
+      max={MAX}
+      value={text}
+      onChange={(e) => {
+        setText(e.target.value);
+        const n = parseFloat(e.target.value);
+        if (!Number.isNaN(n)) onChange(n);
+      }}
+      onBlur={() => {
+        const n = parseFloat(text);
+        if (Number.isNaN(n)) {
+          setText(value === null ? "" : fmt(value));
+          return;
+        }
+        const clamped = Math.max(MIN, Math.min(MAX, n));
+        if (clamped !== n) {
+          onChange(clamped);
+          setText(fmt(clamped));
+        }
+      }}
+      className="w-14 bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[11px] font-mono text-white/80 text-right focus:outline-none focus:border-cyan-400/50"
+    />
   );
 }

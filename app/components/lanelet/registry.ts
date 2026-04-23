@@ -341,17 +341,25 @@ export interface LaneletEndSnap {
  *
  * Returns null when nothing qualifies, in which case the caller should
  * fall back to per-corner attach.
+ *
+ * `subType` restricts the search to lanelets of that kind. Crosswalks
+ * sit on top of road lanelets (zebra stripes inside a junction, etc.)
+ * so their endpoints often fall within the snap threshold of nearby
+ * road endpoints even though they're semantically unrelated — without
+ * this filter, placing a crosswalk would silently glue it to the road.
  */
 export function findNearestLaneletEnd(
   reg: NodeRegistry,
   lanelets: readonly Lanelet[],
   click: Vec3,
-  threshold: number
+  threshold: number,
+  subType?: Lanelet["subType"],
 ): LaneletEndSnap | null {
   let best: LaneletEndSnap | null = null;
   let bestD = threshold;
 
   for (const l of lanelets) {
+    if (subType !== undefined && l.subType !== subType) continue;
     const last = l.leftBoundary.length - 1;
     for (const end of ["start", "end"] as const) {
       const idx = end === "start" ? 0 : last;
