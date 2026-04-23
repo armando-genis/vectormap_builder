@@ -105,6 +105,14 @@ export interface Lanelet {
    * curve-capable editing behaviour.
    */
   straight?: boolean;
+
+  /**
+   * "Position lock": when true, all drag handles (node and move) are hidden
+   * and pointer-down events that would start a drag are silently ignored.
+   * The lanelet can still be selected and have its properties edited; it just
+   * cannot be translated or have its shape changed by dragging.
+   */
+  positionLocked?: boolean;
 }
 
 /**

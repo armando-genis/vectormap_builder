@@ -12,10 +12,12 @@ import type { DragHandleState } from "./lanelet/LaneletLayer";
 import { LaneletProperties } from "./lanelet/LaneletProperties";
 import {
   applyLaneletTranslationFromSnapshot,
+  applyPlaneToLanelet,
   collectNodeIdsOfOtherSubType,
   createLanelet,
   duplicateLaneletLeft,
   duplicateLaneletRight,
+  fitPlaneRansac,
   joinLanelets,
   moveLaneletNodeAtIndex,
   resizeLaneletWidth,
@@ -53,6 +55,40 @@ type CameraMode = "3d" | "2d";
 // "crop-center" = one-shot pick mode: next click on the PCD sets the Z-clip
 //                 region's center; the tool auto-returns to "view".
 type Tool       = "view" | "lanelet" | "crosswalk" | "crop-center";
+
+/**
+ * Per-position ceiling height, mirroring the fragment shader in PointCloud.
+ * When cropRegion is null the ceiling is flat at zCeiling globally.
+ * When inside the crop rectangle the ceiling is the tilted plane.
+ * When outside the rectangle (crop enabled, no clip there) returns zCeiling
+ * so the raycast still finds real surface points.
+ */
+function effectiveCeilingAt(
+  x: number,
+  z: number,
+  zCeiling: number,
+  crop: CropRegion | null
+): number {
+  if (!crop) return zCeiling;
+
+  const dx  = x - crop.cx;
+  const dz  = z - crop.cz;
+  const cosA = Math.cos(crop.angle);
+  const sinA = Math.sin(crop.angle);
+  // Rotate world delta into crop-local frame (matches shader uCropRot logic)
+  const lx =  dx * cosA + dz * sinA;
+  const lz = -dx * sinA + dz * cosA;
+
+  if (Math.abs(lx) > crop.halfW || Math.abs(lz) > crop.halfL) {
+    // Outside the rectangle: no ceiling is applied by the shader.
+    return zCeiling;
+  }
+
+  const MAX_TILT = (85 * Math.PI) / 180;
+  const pitch = Math.max(-MAX_TILT, Math.min(MAX_TILT, crop.pitch));
+  const roll  = Math.max(-MAX_TILT, Math.min(MAX_TILT, crop.roll));
+  return zCeiling + Math.tan(roll) * lx + Math.tan(pitch) * lz;
+}
 
 interface SceneProps {
   geometry: THREE.BufferGeometry | null;
@@ -92,8 +128,13 @@ interface SceneProps {
   /** Called after every in-place edit (drag, surface-snap). Updates both
    *  registry and the single lanelet atomically. */
   onUpsertLanelet: (reg: NodeRegistry, l: Lanelet) => void;
+  onToggleStraight: (id: number) => void;
+  onTogglePositionLocked: (id: number) => void;
 
   nextLaneletIdRef: React.MutableRefObject<number>;
+  /** Ref to the group of all chunk <points> — owned by SceneViewer so
+   *  operations outside the Canvas (e.g. fit-plane) can read raw positions. */
+  pointsRef: React.RefObject<THREE.Group | null>;
 }
 
 function Scene({
@@ -119,15 +160,13 @@ function Scene({
   onStartLanelet,
   onFinishLanelet,
   onUpsertLanelet,
+  onToggleStraight,
+  onTogglePositionLocked,
   nextLaneletIdRef,
+  pointsRef,
 }: SceneProps) {
   const { camera, raycaster, gl } = useThree();
   const controlsRef = useRef<any>(null);
-  // Group of chunk <points> objects. `sampleSurfaceY` walks it recursively
-  // and intersectObject's per-child bounding-sphere test early-rejects
-  // tiles the pick ray misses, so raycasting scales with the number of
-  // tiles the ray actually touches, not total point count.
-  const pointsRef   = useRef<THREE.Group | null>(null);
 
   // Always-current reads inside long-running drag handlers.
   const laneletsRef = useRef(lanelets);
@@ -202,11 +241,13 @@ function Scene({
   // `snapshot[id] + delta`, which keeps the drag idempotent (no drift).
   // --------------------------------------------------------------------
   const handleHandlePointerDown = (id: number, index: number) => {
+    if (laneletsRef.current.find((l) => l.id === id)?.positionLocked) return;
     if (controlsRef.current) controlsRef.current.enabled = false;
     setDragHandle({ kind: "node", id, index });
   };
 
   const handleMoveHandlePointerDown = (id: number) => {
+    if (laneletsRef.current.find((l) => l.id === id)?.positionLocked) return;
     if (controlsRef.current) controlsRef.current.enabled = false;
     setDragHandle({ kind: "move", id });
   };
@@ -315,9 +356,6 @@ function Scene({
     };
 
     const onUp = () => {
-      const bbox = geometry?.boundingBox;
-      const topY = (bbox?.max.y ?? 1e4) + 10;
-
       const curr = laneletsRef.current.find((l) => l.id === dragHandle.id);
       if (curr) {
         surfaceRc.params.Points = {
@@ -325,7 +363,11 @@ function Scene({
           threshold: Math.max(0.1, Math.min(curr.width / 6, 0.8)),
         };
         const snapY = (x: number, z: number, fb: number) =>
-          sampleSurfaceY(surfaceRc, pointsRef.current, x, z, topY, fb);
+          sampleSurfaceY(
+            surfaceRc, pointsRef.current, x, z,
+            effectiveCeilingAt(x, z, zCeiling, cropRegion) + 0.5,
+            fb
+          );
 
         const { reg, lanelet } = snapLaneletToSurface(
           registryRef.current,
@@ -415,16 +457,17 @@ function Scene({
       newSubType,
     );
 
-    const bbox = geometry?.boundingBox;
-    const topY = (bbox?.max.y ?? 1e4) + 10;
-
     surfaceRc.params.Points = {
       ...(surfaceRc.params.Points ?? {}),
       threshold: Math.max(0.1, Math.min(width / 6, 0.8)),
     };
 
     const snapY = (x: number, z: number, fallback: number) =>
-      sampleSurfaceY(surfaceRc, pointsRef.current, x, z, topY, fallback);
+      sampleSurfaceY(
+        surfaceRc, pointsRef.current, x, z,
+        effectiveCeilingAt(x, z, zCeiling, cropRegion) + 0.5,
+        fallback
+      );
 
     const { reg, lanelet } = createLanelet({
       reg: registryRef.current,
@@ -520,6 +563,8 @@ function Scene({
         onHandlePointerDown={handleHandlePointerDown}
         onMoveHandlePointerDown={handleMoveHandlePointerDown}
         activeDragHandle={dragHandle}
+        onToggleStraight={onToggleStraight}
+        onTogglePositionLocked={onTogglePositionLocked}
         pendingStart={pendingStart}
         pendingStartAttached={pendingStartSnap !== null}
         sceneRadius={r}
@@ -860,7 +905,6 @@ function CropScalarField({
         value={value}
         step={step}
         min={min}
-        max={max}
         onChange={onChange}
         fmt={fmt}
         className="w-14 bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] font-mono text-amber-200/90 text-right focus:outline-none focus:border-amber-300/60"
@@ -912,6 +956,7 @@ export function SceneViewer({
 
   const nextLaneletIdRef = useRef(1);
   const nextNodeIdRef    = useRef(1);
+  const pointsRef        = useRef<THREE.Group | null>(null);
 
   const pointSize = cameraMode === "3d" ? pointSize3d : pointSize2d;
 
@@ -1212,6 +1257,18 @@ export function SceneViewer({
   // any existing curvature onto the straight start→end axis immediately
   // so the UI reflects the locked shape without waiting for a drag.
   // Turning it OFF just clears the flag — the current geometry stays.
+  const handleToggleStraight = (id: number) => {
+    const lanelet = lanelets.find((l) => l.id === id);
+    if (!lanelet) return;
+    setStraightIds([id], !lanelet.straight);
+  };
+
+  const handleTogglePositionLocked = (id: number) => {
+    setLanelets((ls) =>
+      ls.map((l) => (l.id === id ? { ...l, positionLocked: !l.positionLocked } : l))
+    );
+  };
+
   const setStraightIds = (ids: number[], straight: boolean) => {
     const idSet = new Set(ids);
     if (!straight) {
@@ -1229,6 +1286,67 @@ export function SceneViewer({
     });
     setRegistry(nextReg);
     setLanelets(nextLanelets);
+  };
+
+  /**
+   * Fit-on-plane: collect PCD points that fall inside each selected lanelet's
+   * XZ bounding box (+ half-width margin), run RANSAC to find the dominant
+   * road plane while rejecting car-roof / noise outliers, then project every
+   * boundary node onto that plane.
+   */
+  const fitPlaneIds = (ids: number[]) => {
+    const group = pointsRef.current;
+    if (!group) return;
+
+    let reg = registry;
+
+    for (const id of ids) {
+      const lanelet = lanelets.find((l) => l.id === id);
+      if (!lanelet) continue;
+
+      // XZ bounding box of all boundary nodes + half-width margin
+      const allNodeIds = new Set([
+        ...lanelet.leftBoundary,
+        ...lanelet.rightBoundary,
+      ]);
+      let xMin = Infinity, xMax = -Infinity;
+      let zMin = Infinity, zMax = -Infinity;
+      for (const nid of allNodeIds) {
+        const p = getNode(reg, nid);
+        if (p[0] < xMin) xMin = p[0];
+        if (p[0] > xMax) xMax = p[0];
+        if (p[2] < zMin) zMin = p[2];
+        if (p[2] > zMax) zMax = p[2];
+      }
+      const margin = lanelet.width * 0.5;
+      xMin -= margin; xMax += margin;
+      zMin -= margin; zMax += margin;
+
+      // Collect PCD points inside the box that are below the crop ceiling
+      const raw: number[] = [];
+      group.traverse((obj) => {
+        if (!(obj instanceof THREE.Points)) return;
+        const pos = obj.geometry.attributes.position as THREE.BufferAttribute;
+        for (let i = 0; i < pos.count; i++) {
+          const x = pos.getX(i);
+          const z = pos.getZ(i);
+          if (x < xMin || x > xMax || z < zMin || z > zMax) continue;
+          const y = pos.getY(i);
+          if (y > effectiveCeilingAt(x, z, zCeiling, cropRegion)) continue;
+          raw.push(x, y, z);
+        }
+      });
+
+      const count = raw.length / 3;
+      if (count < 3) continue;
+
+      const plane = fitPlaneRansac(new Float32Array(raw), count);
+      if (!plane) continue;
+
+      reg = applyPlaneToLanelet(reg, lanelet, plane.a, plane.b, plane.c);
+    }
+
+    setRegistry(reg);
   };
 
   const duplicateNeighbor = (sourceId: number, side: "left" | "right") => {
@@ -1414,7 +1532,10 @@ export function SceneViewer({
           onStartLanelet={handleStartLanelet}
           onFinishLanelet={handleFinishLanelet}
           onUpsertLanelet={handleUpsertLanelet}
+          onToggleStraight={handleToggleStraight}
+          onTogglePositionLocked={handleTogglePositionLocked}
           nextLaneletIdRef={nextLaneletIdRef}
+          pointsRef={pointsRef}
         />
         {showStats && <Stats className="!left-auto !right-4 !top-4" />}
       </Canvas>
@@ -1524,6 +1645,7 @@ export function SceneViewer({
         onDuplicateNeighbor={duplicateNeighbor}
         onCreateJoint={createJoint}
         onSetStraight={setStraightIds}
+        onFitPlane={fitPlaneIds}
       />
 
       {/* ── Tool panel ──────────────────────────────────────── */}

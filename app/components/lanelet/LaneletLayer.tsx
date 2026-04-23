@@ -53,6 +53,10 @@ interface LaneletLayerProps {
   onMoveHandlePointerDown: (id: number) => void;
   /** Which handle is currently being dragged, if any. */
   activeDragHandle: DragHandleState | null;
+  /** Toggle rect-lock (straight) on a lanelet from the in-scene label. */
+  onToggleStraight: (id: number) => void;
+  /** Toggle position-lock — hides all drag handles and blocks moves. */
+  onTogglePositionLocked: (id: number) => void;
   pendingStart: Vec3 | null;
   pendingStartAttached: boolean;
   sceneRadius: number;
@@ -68,6 +72,8 @@ export function LaneletLayer({
   onHandlePointerDown,
   onMoveHandlePointerDown,
   activeDragHandle,
+  onToggleStraight,
+  onTogglePositionLocked,
   pendingStart,
   pendingStartAttached,
   sceneRadius,
@@ -87,10 +93,12 @@ export function LaneletLayer({
             selectable={selectable}
             onSelect={onSelect}
             arrowSize={arrowSize}
-            showHandles={editable && isSelected}
+            showHandles={editable && isSelected && !l.positionLocked}
             onHandlePointerDown={onHandlePointerDown}
             onMoveHandlePointerDown={onMoveHandlePointerDown}
             activeDragHandle={activeDragHandle}
+            onToggleStraight={onToggleStraight}
+            onTogglePositionLocked={onTogglePositionLocked}
           />
         );
       })}
@@ -124,6 +132,8 @@ interface LaneletMeshProps {
   onHandlePointerDown: (id: number, index: number) => void;
   onMoveHandlePointerDown: (id: number) => void;
   activeDragHandle: DragHandleState | null;
+  onToggleStraight: (id: number) => void;
+  onTogglePositionLocked: (id: number) => void;
 }
 
 function LaneletMesh({
@@ -136,6 +146,8 @@ function LaneletMesh({
   onHandlePointerDown,
   onMoveHandlePointerDown,
   activeDragHandle,
+  onToggleStraight,
+  onTogglePositionLocked,
 }: LaneletMeshProps) {
   const {
     leftSmooth,
@@ -423,6 +435,10 @@ function LaneletMesh({
         <LaneletIdLabel
           pos={centerSmooth[Math.floor(nSmo / 2)]}
           id={lanelet.id}
+          rectLocked={!!lanelet.straight}
+          positionLocked={!!lanelet.positionLocked}
+          onToggleRectLock={() => onToggleStraight(lanelet.id)}
+          onTogglePositionLock={() => onTogglePositionLocked(lanelet.id)}
         />
       )}
     </>
@@ -437,34 +453,95 @@ function LaneletMesh({
 // over the ribbon.
 // ---------------------------------------------------------------------------
 interface LaneletIdLabelProps {
-  pos: Vec3;
-  id:  number;
+  pos:                  Vec3;
+  id:                   number;
+  rectLocked:           boolean;
+  positionLocked:       boolean;
+  onToggleRectLock:     () => void;
+  onTogglePositionLock: () => void;
 }
 
-function LaneletIdLabel({ pos, id }: LaneletIdLabelProps) {
+function LaneletIdLabel({
+  pos, id, rectLocked, positionLocked, onToggleRectLock, onTogglePositionLock,
+}: LaneletIdLabelProps) {
+  const htmlPos = useMemo<[number, number, number]>(
+    () => [pos[0], pos[1] + 0.05, pos[2]],
+    [pos[0], pos[1], pos[2]]
+  );
+
+  const LockIcon = ({ locked }: { locked: boolean }) => (
+    <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+      {locked ? (
+        <path strokeLinecap="round" strokeLinejoin="round"
+          d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+      ) : (
+        <path strokeLinecap="round" strokeLinejoin="round"
+          d="M13.5 10.5V6.75a4.5 4.5 0 1 1 9 0v3.75M3.75 21.75h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H3.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+      )}
+    </svg>
+  );
+
   return (
-    <Html
-      position={[pos[0], pos[1] + 0.05, pos[2]]}
-      center
-      zIndexRange={[100, 0]}
-      style={{ pointerEvents: "none" }}
-    >
+    <Html position={htmlPos} center zIndexRange={[100, 0]}>
       <div
         style={{
-          padding:       "2px 8px",
+          display:       "flex",
+          alignItems:    "center",
+          gap:           3,
+          padding:       "3px 7px 3px 10px",
           borderRadius:  9999,
-          background:    "rgba(0, 0, 0, 0.65)",
+          background:    "rgba(0,0,0,0.70)",
+          border:        "1px solid rgba(255,255,255,0.12)",
           color:         "#ffffff",
-          fontSize:      12,
+          fontSize:      16,
           fontFamily:    "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
           fontWeight:    600,
           letterSpacing: 0.2,
           whiteSpace:    "nowrap",
           userSelect:    "none",
           lineHeight:    1,
+          pointerEvents: "auto",
         }}
       >
         {`#${id}`}
+
+        {/* Rect-lock (amber) */}
+        <button
+          onClick={(e) => { e.stopPropagation(); onToggleRectLock(); }}
+          title={rectLocked ? "Rect lock ON — click to unlock" : "Rect lock OFF — click to lock straight"}
+          style={{
+            background: rectLocked ? "rgba(217,119,6,0.75)" : "none",
+            border:     rectLocked ? "1px solid rgba(251,191,36,0.5)" : "1px solid transparent",
+            borderRadius: 9999,
+            padding:    "1px 4px",
+            cursor:     "pointer",
+            display:    "flex",
+            alignItems: "center",
+            opacity:    rectLocked ? 1 : 0.4,
+            color:      rectLocked ? "#fde68a" : "#ffffff",
+          }}
+        >
+          <LockIcon locked={rectLocked} />
+        </button>
+
+        {/* Position-lock (red) */}
+        <button
+          onClick={(e) => { e.stopPropagation(); onTogglePositionLock(); }}
+          title={positionLocked ? "Position locked — click to allow moving" : "Unlocked — click to freeze position"}
+          style={{
+            background: positionLocked ? "rgba(185,28,28,0.75)" : "none",
+            border:     positionLocked ? "1px solid rgba(248,113,113,0.5)" : "1px solid transparent",
+            borderRadius: 9999,
+            padding:    "1px 4px",
+            cursor:     "pointer",
+            display:    "flex",
+            alignItems: "center",
+            opacity:    positionLocked ? 1 : 0.4,
+            color:      positionLocked ? "#fca5a5" : "#ffffff",
+          }}
+        >
+          <LockIcon locked={positionLocked} />
+        </button>
       </div>
     </Html>
   );
@@ -619,7 +696,7 @@ interface MoveHandleProps {
   onPointerDown: () => void;
 }
 
-const MOVE_HANDLE_HIT_PIXELS = 18;
+const MOVE_HANDLE_HIT_PIXELS = 30;
 
 function MoveHandle({ pos, active, onPointerDown }: MoveHandleProps) {
   const dotGeo = useMemo(() => {
@@ -652,7 +729,7 @@ function MoveHandle({ pos, active, onPointerDown }: MoveHandleProps) {
     <>
       <points geometry={dotGeo} renderOrder={RO_HANDLE}>
         <pointsMaterial
-          size={26}
+          size={40}
           sizeAttenuation={false}
           color={haloColor}
           transparent
@@ -663,7 +740,7 @@ function MoveHandle({ pos, active, onPointerDown }: MoveHandleProps) {
       </points>
       <points geometry={dotGeo} renderOrder={RO_HANDLE + 1}>
         <pointsMaterial
-          size={14}
+          size={22}
           sizeAttenuation={false}
           color={coreColor}
           transparent

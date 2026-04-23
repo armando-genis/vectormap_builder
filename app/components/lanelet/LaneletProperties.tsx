@@ -21,6 +21,7 @@ interface LaneletPropertiesProps {
    * points are snapped onto the straight start→end axis and stay there.
    */
   onSetStraight: (ids: number[], straight: boolean) => void;
+  onFitPlane: (ids: number[]) => void;
 }
 
 export function LaneletProperties({
@@ -34,6 +35,7 @@ export function LaneletProperties({
   onDuplicateNeighbor,
   onCreateJoint,
   onSetStraight,
+  onFitPlane,
 }: LaneletPropertiesProps) {
   // Joint panel local state — target lanelet id and turn type.
   // Hooks must run unconditionally, so declare them before the early
@@ -337,32 +339,44 @@ export function LaneletProperties({
       })()}
 
       {/* ── Actions ───────────────────────────────────────── */}
-      <div className="flex gap-2 pt-1">
-        {/* Reverse is only meaningful for directional road lanelets. */}
-        {!allCrosswalk && (
-          <button
-            onClick={() => onReverse(ids)}
-            className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-white/60 border border-white/10 hover:text-white/90 hover:bg-white/5 transition-colors cursor-pointer"
-            title="Flip direction of travel"
-          >
-            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round"
-                d="M7 16V4m0 0L3 8m4-4 4 4m6 0v12m0 0 4-4m-4 4-4-4" />
-            </svg>
-            Reverse
-          </button>
-        )}
+      <div className="flex flex-col gap-2 pt-1">
         <button
-          onClick={() => onDelete(ids)}
-          className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-red-300/80 border border-red-400/20 bg-red-500/5 hover:bg-red-500/15 hover:text-red-200 transition-colors cursor-pointer"
-          title="Delete (Del)"
+          onClick={() => onFitPlane(ids)}
+          className="flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-violet-300/90 border border-violet-400/30 bg-violet-500/10 hover:bg-violet-500/20 hover:text-violet-200 transition-colors cursor-pointer"
+          title="Fit the lanelet's boundary nodes onto the dominant road plane found in the point cloud below it (RANSAC — rejects car roofs and noise)"
         >
           <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round"
-              d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79" />
+              d="M3 7h18M3 12h18M3 17h18" />
           </svg>
-          Delete
+          Fit on plane
         </button>
+        <div className="flex gap-2">
+          {!allCrosswalk && (
+            <button
+              onClick={() => onReverse(ids)}
+              className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-white/60 border border-white/10 hover:text-white/90 hover:bg-white/5 transition-colors cursor-pointer"
+              title="Flip direction of travel"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round"
+                  d="M7 16V4m0 0L3 8m4-4 4 4m6 0v12m0 0 4-4m-4 4-4-4" />
+              </svg>
+              Reverse
+            </button>
+          )}
+          <button
+            onClick={() => onDelete(ids)}
+            className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-red-300/80 border border-red-400/20 bg-red-500/5 hover:bg-red-500/15 hover:text-red-200 transition-colors cursor-pointer"
+            title="Delete (Del)"
+          >
+            <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round"
+                d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79" />
+            </svg>
+            Delete
+          </button>
+        </div>
       </div>
     </div>
   );

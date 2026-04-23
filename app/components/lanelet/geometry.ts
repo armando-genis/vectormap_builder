@@ -229,12 +229,17 @@ export function createLanelet(
     rightRaw[i] = [c[0] - lx * half, c[1], c[2] - lz * half];
   }
 
-  // Surface-snap Y at every position (fallback: the raw Y that came from
-  // the lerp, which itself is lerped from the caller's two click Ys).
-  const snapC = (p: Vec3): Vec3 =>
-    snapY ? [p[0], snapY(p[0], p[2], p[1]), p[2]] : p;
-  const leftPos  = leftRaw.map(snapC);
-  const rightPos = rightRaw.map(snapC);
+  // Surface-snap Y at the two centerline endpoints only, then linearly
+  // interpolate Y for all interior positions.  Sampling every offset
+  // boundary corner independently risks snapping to curbs, parked cars,
+  // or other noise above the road plane, which bows the ribbon into a
+  // V-shape.  A linear ramp between the two snapped endpoint Ys keeps the
+  // lanelet planar while still following sloped roads.
+  const yS = snapY ? snapY(cs[0], cs[2], cs[1]) : cs[1];
+  const yE = snapY ? snapY(ce[0], ce[2], ce[1]) : ce[1];
+  const rampY = (i: number): number => n <= 1 ? yS : yS + (yE - yS) * (i / (n - 1));
+  const leftPos: Vec3[]  = leftRaw.map((p, i)  => [p[0], rampY(i), p[2]]);
+  const rightPos: Vec3[] = rightRaw.map((p, i) => [p[0], rampY(i), p[2]]);
 
   // Allocate / attach NodeIds. placeCorner for endpoints (attach allowed
   // → picks up nearby existing nodes), addNode for interior (always fresh
@@ -522,6 +527,146 @@ export function snapLaneletToSurface(
     reg: moveNodes(reg, updates),
     lanelet,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Plane fitting (RANSAC + least-squares refit)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fit a best-fit plane  y = a·x + b·z + c  to a set of points using RANSAC
+ * so that noise from car rooftops, trajectory artefacts, and parked vehicles
+ * is rejected before the final least-squares refit over inliers.
+ *
+ * `pts`          – packed Float32Array of (x, y, z) triples
+ * `ptCount`      – number of points (pts.length must be ptCount * 3)
+ * `inlierThresh` – max vertical residual to be counted as an inlier (metres).
+ *                  0.15 m handles lane-marking ridges and typical sensor noise
+ *                  while excluding car roofs (≥ 0.5 m) and trajectory blobs.
+ * Returns null when fewer than 3 inliers survive.
+ */
+export function fitPlaneRansac(
+  pts: Float32Array,
+  ptCount: number,
+  inlierThresh = 0.15,
+  iterations   = 100,
+): { a: number; b: number; c: number } | null {
+  if (ptCount < 3) return null;
+
+  let bestInliers = -1;
+  let bestA = 0, bestB = 0, bestC = 0;
+
+  for (let it = 0; it < iterations; it++) {
+    // Three distinct random indices
+    const i0 = (Math.random() * ptCount) | 0;
+    let   i1 = (Math.random() * ptCount) | 0;
+    let   i2 = (Math.random() * ptCount) | 0;
+    if (i1 === i0) i1 = (i1 + 1) % ptCount;
+    if (i2 === i0 || i2 === i1) i2 = (i2 + 1) % ptCount;
+    if (i2 === i0 || i2 === i1) continue;
+
+    const x0 = pts[i0*3], y0 = pts[i0*3+1], z0 = pts[i0*3+2];
+    const x1 = pts[i1*3], y1 = pts[i1*3+1], z1 = pts[i1*3+2];
+    const x2 = pts[i2*3], y2 = pts[i2*3+1], z2 = pts[i2*3+2];
+
+    // Cross product of the two edge vectors → plane normal
+    const ux = x1-x0, uy = y1-y0, uz = z1-z0;
+    const vx = x2-x0, vy = y2-y0, vz = z2-z0;
+    let nx = uy*vz - uz*vy;
+    let ny = uz*vx - ux*vz;
+    let nz = ux*vy - uy*vx;
+    const nl = Math.hypot(nx, ny, nz);
+    // Skip near-degenerate (collinear) or near-vertical planes (ny < 10% of norm)
+    if (nl < 1e-8 || Math.abs(ny) < 0.1 * nl) continue;
+    nx /= nl; ny /= nl; nz /= nl;
+
+    // y = -(nx/ny)·x - (nz/ny)·z + (N·P0)/ny
+    const a = -(nx / ny);
+    const b = -(nz / ny);
+    const c = (nx*x0 + ny*y0 + nz*z0) / ny;
+
+    let cnt = 0;
+    for (let i = 0; i < ptCount; i++) {
+      const r = pts[i*3+1] - a*pts[i*3] - b*pts[i*3+2] - c;
+      if (Math.abs(r) <= inlierThresh) cnt++;
+    }
+    if (cnt > bestInliers) { bestInliers = cnt; bestA = a; bestB = b; bestC = c; }
+  }
+
+  if (bestInliers < 3) return null;
+
+  // Least-squares refit on inliers only via the normal equations:
+  // [Σxx Σxz Σx] [a]   [Σxy]
+  // [Σxz Σzz Σz] [b] = [Σzy]
+  // [Σx  Σz  n ] [c]   [Σy ]
+  let sxx=0, sxz=0, sx=0, szz=0, sz=0, sxy=0, szy=0, sy=0, n=0;
+  for (let i = 0; i < ptCount; i++) {
+    const x=pts[i*3], y=pts[i*3+1], z=pts[i*3+2];
+    if (Math.abs(y - bestA*x - bestB*z - bestC) > inlierThresh) continue;
+    sxx+=x*x; sxz+=x*z; sx+=x;
+    szz+=z*z; sz+=z;
+    sxy+=x*y; szy+=z*y; sy+=y; n++;
+  }
+  if (n < 3) return { a: bestA, b: bestB, c: bestC };
+
+  const sol = _solveNormalEqs3(sxx, sxz, sx, szz, sz, n, sxy, szy, sy);
+  return sol ?? { a: bestA, b: bestB, c: bestC };
+}
+
+/** Gaussian elimination with partial pivoting for the 3×3 normal equations. */
+function _solveNormalEqs3(
+  sxx: number, sxz: number, sx: number,
+  szz: number, sz: number,  n:  number,
+  sxy: number, szy: number, sy: number,
+): { a: number; b: number; c: number } | null {
+  const A = [
+    [sxx, sxz, sx, sxy],
+    [sxz, szz, sz, szy],
+    [sx,  sz,  n,  sy ],
+  ];
+  for (let col = 0; col < 3; col++) {
+    let maxRow = col;
+    for (let row = col+1; row < 3; row++) {
+      if (Math.abs(A[row][col]) > Math.abs(A[maxRow][col])) maxRow = row;
+    }
+    [A[col], A[maxRow]] = [A[maxRow], A[col]];
+    if (Math.abs(A[col][col]) < 1e-12) return null;
+    for (let row = col+1; row < 3; row++) {
+      const f = A[row][col] / A[col][col];
+      for (let c2 = col; c2 <= 3; c2++) A[row][c2] -= f * A[col][c2];
+    }
+  }
+  const x = [0, 0, 0];
+  for (let i = 2; i >= 0; i--) {
+    x[i] = A[i][3];
+    for (let j = i+1; j < 3; j++) x[i] -= A[i][j] * x[j];
+    x[i] /= A[i][i];
+  }
+  return { a: x[0], b: x[1], c: x[2] };
+}
+
+/**
+ * Project every boundary node of `lanelet` onto the plane  y = a·x + b·z + c
+ * and return the updated registry.
+ */
+export function applyPlaneToLanelet(
+  reg: NodeRegistry,
+  lanelet: Lanelet,
+  a: number,
+  b: number,
+  c: number,
+): NodeRegistry {
+  const updates: Record<NodeId, Vec3> = {};
+  const seen = new Set<NodeId>();
+  const apply = (id: NodeId) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    const p = getNode(reg, id);
+    updates[id] = [p[0], a * p[0] + b * p[2] + c, p[2]];
+  };
+  for (const id of lanelet.leftBoundary)  apply(id);
+  for (const id of lanelet.rightBoundary) apply(id);
+  return moveNodes(reg, updates);
 }
 
 // ---------------------------------------------------------------------------
