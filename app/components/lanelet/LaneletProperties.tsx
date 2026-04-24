@@ -54,6 +54,7 @@ export function LaneletProperties({
   if (selectedIds.size === 0) return null;
 
   const selected = lanelets.filter((l) => selectedIds.has(l.id));
+  if (selected.length === 0) return null;
   const single   = selected.length === 1 ? selected[0] : null;
   const ids      = selected.map((l) => l.id);
 
@@ -342,8 +343,9 @@ export function LaneletProperties({
       <div className="flex flex-col gap-2 pt-1">
         <button
           onClick={() => onFitPlane(ids)}
-          className="flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-violet-300/90 border border-violet-400/30 bg-violet-500/10 hover:bg-violet-500/20 hover:text-violet-200 transition-colors cursor-pointer"
-          title="Fit the lanelet's boundary nodes onto the dominant road plane found in the point cloud below it (RANSAC — rejects car roofs and noise)"
+          disabled={selected.every((l) => l.positionLocked)}
+          className="flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-mono text-violet-300/90 border border-violet-400/30 bg-violet-500/10 hover:bg-violet-500/20 hover:text-violet-200 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-violet-500/10 disabled:hover:text-violet-300/90"
+          title={selected.every((l) => l.positionLocked) ? "Position locked — unlock to fit on plane" : "Fit the lanelet's boundary nodes onto the dominant road plane found in the point cloud below it (RANSAC — rejects car roofs and noise)"}
         >
           <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round"

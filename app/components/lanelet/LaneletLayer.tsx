@@ -469,7 +469,15 @@ function LaneletIdLabel({
     [pos[0], pos[1], pos[2]]
   );
 
-  const LockIcon = ({ locked }: { locked: boolean }) => (
+  // Straight-lane icon: two parallel horizontal lines = shape locked to straight.
+  const StraightIcon = () => (
+    <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2.2} viewBox="0 0 24 24">
+      <path strokeLinecap="round" d="M3 8h18M3 16h18" />
+    </svg>
+  );
+
+  // Padlock icon: full position freeze.
+  const PadlockIcon = ({ locked }: { locked: boolean }) => (
     <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
       {locked ? (
         <path strokeLinecap="round" strokeLinejoin="round"
@@ -505,10 +513,10 @@ function LaneletIdLabel({
       >
         {`#${id}`}
 
-        {/* Rect-lock (amber) */}
+        {/* Rect-lock (amber) — two parallel lines = straight shape constraint */}
         <button
           onClick={(e) => { e.stopPropagation(); onToggleRectLock(); }}
-          title={rectLocked ? "Rect lock ON — click to unlock" : "Rect lock OFF — click to lock straight"}
+          title={rectLocked ? "Straight lock ON — click to allow curves" : "Curves allowed — click to lock straight"}
           style={{
             background: rectLocked ? "rgba(217,119,6,0.75)" : "none",
             border:     rectLocked ? "1px solid rgba(251,191,36,0.5)" : "1px solid transparent",
@@ -521,10 +529,10 @@ function LaneletIdLabel({
             color:      rectLocked ? "#fde68a" : "#ffffff",
           }}
         >
-          <LockIcon locked={rectLocked} />
+          <StraightIcon />
         </button>
 
-        {/* Position-lock (red) */}
+        {/* Position-lock (red) — padlock = full freeze (no drag, no fit-on-plane) */}
         <button
           onClick={(e) => { e.stopPropagation(); onTogglePositionLock(); }}
           title={positionLocked ? "Position locked — click to allow moving" : "Unlocked — click to freeze position"}
@@ -540,7 +548,7 @@ function LaneletIdLabel({
             color:      positionLocked ? "#fca5a5" : "#ffffff",
           }}
         >
-          <LockIcon locked={positionLocked} />
+          <PadlockIcon locked={positionLocked} />
         </button>
       </div>
     </Html>

@@ -39,6 +39,7 @@ import {
   resolveAll,
 } from "./lanelet/registry";
 import { downloadLanelet2Osm } from "./lanelet/export";
+import { saveSession, loadSessionFile } from "./session";
 import type { LaneletEndSnap } from "./lanelet/registry";
 import type {
   Lanelet,
@@ -1173,6 +1174,8 @@ export function SceneViewer({
       id: nextLaneletIdRef.current++,
       leftBoundary:  l.leftBoundary.map((id)  => idMap.get(id) ?? id),
       rightBoundary: l.rightBoundary.map((id) => idMap.get(id) ?? id),
+      positionLocked: false,
+      straight:       false,
     }));
 
     setRegistry(reg);
@@ -1303,6 +1306,7 @@ export function SceneViewer({
     for (const id of ids) {
       const lanelet = lanelets.find((l) => l.id === id);
       if (!lanelet) continue;
+      if (lanelet.positionLocked) continue;
 
       // XZ bounding box of all boundary nodes + half-width margin
       const allNodeIds = new Set([
@@ -1359,7 +1363,7 @@ export function SceneViewer({
         : duplicateLaneletRight(registry, nextNodeIdRef, src);
 
     const newId = nextLaneletIdRef.current++;
-    const newLanelet: Lanelet = { ...neighbor, id: newId };
+    const newLanelet: Lanelet = { ...neighbor, id: newId, positionLocked: false, straight: false };
 
     setRegistry(newReg);
     setLanelets((ls) =>
@@ -1497,6 +1501,36 @@ export function SceneViewer({
         ? fileName.slice(0, -4)
         : fileName || "lanelet2_map";
     downloadLanelet2Osm(registry, lanelets, `${base}.osm`);
+  };
+
+  const sessionFileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleSaveSession = () => {
+    const base =
+      fileName && fileName.toLowerCase().endsWith(".pcd")
+        ? fileName.slice(0, -4)
+        : fileName || "session";
+    saveSession({ voxelSize, zCeiling, crop, registry, lanelets }, base);
+  };
+
+  const handleLoadSession = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    try {
+      const s = await loadSessionFile(file);
+      setRegistry(s.registry);
+      setLanelets(s.lanelets);
+      setZCeiling(s.zCeiling);
+      setCrop(s.crop);
+      onVoxelSizeChange(s.voxelSize);
+      const maxLaneletId = s.lanelets.reduce((m, l) => Math.max(m, l.id), 0);
+      nextLaneletIdRef.current = maxLaneletId + 1;
+      const nodeIds = Object.keys(s.registry.nodes).map(Number);
+      nextNodeIdRef.current = (nodeIds.length > 0 ? Math.max(...nodeIds) : 0) + 1;
+    } catch (err) {
+      alert(`Failed to load session: ${(err as Error).message}`);
+    }
   };
 
   return (
@@ -1750,6 +1784,42 @@ export function SceneViewer({
           Download .osm
         </button>
 
+        {/* hidden file picker for session load */}
+        <input
+          ref={sessionFileInputRef}
+          type="file"
+          accept=".vmb"
+          className="hidden"
+          onChange={handleLoadSession}
+        />
+
+        {/* Save session */}
+        <button
+          onClick={handleSaveSession}
+          disabled={lanelets.length === 0}
+          title="Save current session (.vmb)"
+          className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-mono text-sky-300 border border-sky-400/40 bg-sky-500/10 hover:bg-sky-500/20 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-sky-500/10"
+        >
+          <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round"
+              d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z" />
+          </svg>
+          Save session
+        </button>
+
+        {/* Load session */}
+        <button
+          onClick={() => sessionFileInputRef.current?.click()}
+          title="Load a saved session (.vmb)"
+          className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-[11px] font-mono text-sky-300 border border-sky-400/40 bg-sky-500/10 hover:bg-sky-500/20 transition-colors cursor-pointer"
+        >
+          <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round"
+              d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5" />
+          </svg>
+          Load session
+        </button>
+
         <button
           onClick={clearAll}
           disabled={lanelets.length === 0 && !pendingStart}
@@ -1958,32 +2028,49 @@ export function SceneViewer({
       {/* ── Bottom toolbar ──────────────────────────────────── */}
       <div className="absolute bottom-5 left-1/2 -translate-x-1/2 flex items-center gap-2 rounded-xl border border-white/10 bg-black/60 px-4 py-2.5 backdrop-blur-md">
 
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2">
           <svg className="w-3.5 h-3.5 text-white/40 shrink-0" fill="currentColor" viewBox="0 0 20 20">
             <circle cx="10" cy="10" r="2" />
           </svg>
           {cameraMode === "3d" ? (
-            <input
-              key="size-3d"
-              type="range" min="0.005" max="0.2" step="0.005"
-              value={pointSize3d}
-              onChange={(e) => setPointSize3d(parseFloat(e.target.value))}
-              className="w-24 accent-cyan-400 cursor-pointer"
-            />
+            <>
+              <input
+                key="size-3d"
+                type="range" min="0.005" max="5.0" step="0.005"
+                value={Math.min(pointSize3d, 5.0)}
+                onChange={(e) => setPointSize3d(parseFloat(e.target.value))}
+                className="w-28 accent-cyan-400 cursor-pointer"
+              />
+              <NumericInput
+                value={pointSize3d}
+                step={0.005}
+                min={0.001}
+                fmt={(v) => v.toFixed(3)}
+                onChange={(v) => setPointSize3d(Math.max(0.001, v))}
+                className="w-16 text-xs font-mono text-center bg-white/5 border border-white/10 rounded px-1 py-0.5 text-white/60 focus:outline-none focus:border-cyan-400/50"
+              />
+              <span className="text-[10px] font-mono text-white/30">m</span>
+            </>
           ) : (
-            <input
-              key="size-2d"
-              type="range" min="0.5" max="10" step="0.5"
-              value={pointSize2d}
-              onChange={(e) => setPointSize2d(parseFloat(e.target.value))}
-              className="w-24 accent-cyan-400 cursor-pointer"
-            />
+            <>
+              <input
+                key="size-2d"
+                type="range" min="0.5" max="100" step="0.5"
+                value={Math.min(pointSize2d, 100)}
+                onChange={(e) => setPointSize2d(parseFloat(e.target.value))}
+                className="w-28 accent-cyan-400 cursor-pointer"
+              />
+              <NumericInput
+                value={pointSize2d}
+                step={0.5}
+                min={0.1}
+                fmt={(v) => v.toFixed(1)}
+                onChange={(v) => setPointSize2d(Math.max(0.1, v))}
+                className="w-16 text-xs font-mono text-center bg-white/5 border border-white/10 rounded px-1 py-0.5 text-white/60 focus:outline-none focus:border-cyan-400/50"
+              />
+              <span className="text-[10px] font-mono text-white/30">px</span>
+            </>
           )}
-          <span className="text-xs text-white/30 font-mono w-14">
-            {cameraMode === "3d"
-              ? `${pointSize3d.toFixed(3)} m`
-              : `${pointSize2d.toFixed(1)} px`}
-          </span>
         </div>
 
         <div className="w-px h-5 bg-white/10 mx-1" />
