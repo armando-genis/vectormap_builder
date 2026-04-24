@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Html, Line } from "@react-three/drei";
 import { useFrame } from "@react-three/fiber";
 import * as THREE from "three";
@@ -157,7 +157,9 @@ function LaneletMesh({
     subType,
   } = lanelet;
   const n    = centerline.length;        // # of control nodes (= # of drag handles)
-  const nSmo = leftSmooth.length;        // # of smooth samples (>> n for n ≥ 3)
+  // leftSmooth/rightSmooth/centerSmooth are packed Float32Arrays — xyz per
+  // sample, so the sample count is `length / 3`.
+  const nSmo = leftSmooth.length / 3;
   const isCrosswalk = subType === "crosswalk";
 
   // ---- Fill: triangle strip between the smooth left and right polylines.
@@ -168,14 +170,14 @@ function LaneletMesh({
   const fillGeo = useMemo(() => {
     const verts = new Float32Array(nSmo * 2 * 3);
     for (let i = 0; i < nSmo; i++) {
-      const l = leftSmooth[i];
-      const r = rightSmooth[i];
-      verts[i * 6 + 0] = l[0];
-      verts[i * 6 + 1] = l[1];
-      verts[i * 6 + 2] = l[2];
-      verts[i * 6 + 3] = r[0];
-      verts[i * 6 + 4] = r[1];
-      verts[i * 6 + 5] = r[2];
+      const src = i * 3;
+      const dst = i * 6;
+      verts[dst + 0] = leftSmooth [src    ];
+      verts[dst + 1] = leftSmooth [src + 1];
+      verts[dst + 2] = leftSmooth [src + 2];
+      verts[dst + 3] = rightSmooth[src    ];
+      verts[dst + 4] = rightSmooth[src + 1];
+      verts[dst + 5] = rightSmooth[src + 2];
     }
     const indices: number[] = [];
     for (let i = 0; i < nSmo - 1; i++) {
@@ -194,6 +196,12 @@ function LaneletMesh({
     return geo;
   }, [leftSmooth, rightSmooth, nSmo]);
 
+  // Dispose the previous fillGeo as soon as useMemo returns a new one (and on
+  // unmount). R3F's `<mesh geometry={...}>` does NOT auto-dispose the
+  // *replaced* geometry — only the final one at unmount. Without this cleanup
+  // every drag tick leaks a BufferGeometry and its GPU vertex buffer.
+  useEffect(() => () => fillGeo.dispose(), [fillGeo]);
+
   const baseFill = isCrosswalk
     ? FILL_COLOR_CROSSWALK
     : FILL_COLOR_ROAD;
@@ -209,9 +217,12 @@ function LaneletMesh({
   const centerlineLength = useMemo(() => {
     let len = 0;
     for (let i = 0; i < nSmo - 1; i++) {
-      const a = centerSmooth[i];
-      const b = centerSmooth[i + 1];
-      len += Math.hypot(b[0] - a[0], b[2] - a[2]);
+      const a = i * 3;
+      const b = (i + 1) * 3;
+      len += Math.hypot(
+        centerSmooth[b    ] - centerSmooth[a    ],
+        centerSmooth[b + 2] - centerSmooth[a + 2],
+      );
     }
     return len;
   }, [centerSmooth, nSmo]);
@@ -230,9 +241,12 @@ function LaneletMesh({
     // boundaries at physical metre offsets regardless of spline parameter.
     const arc = new Float32Array(nSmo);
     for (let i = 1; i < nSmo; i++) {
-      const a = centerSmooth[i - 1];
-      const b = centerSmooth[i];
-      arc[i] = arc[i - 1] + Math.hypot(b[0] - a[0], b[2] - a[2]);
+      const a = (i - 1) * 3;
+      const b = i * 3;
+      arc[i] = arc[i - 1] + Math.hypot(
+        centerSmooth[b    ] - centerSmooth[a    ],
+        centerSmooth[b + 2] - centerSmooth[a + 2],
+      );
     }
     const total = arc[nSmo - 1];
 
@@ -245,60 +259,57 @@ function LaneletMesh({
     const used    = count * period - gapW;               // metres of stripe+gap+...+stripe
     const offset  = Math.max(0, (total - used) / 2);
 
-    // Walk arc-length from index 0 upward; look up left/right positions at
-    // a given arc length by linearly interpolating between the two smooth
-    // samples bracketing it.
-    const sampleAt = (s: number): { l: Vec3; r: Vec3 } => {
-      // Linear scan is fine: nSmo is small (hundreds at most).
+    // Walk arc-length from index 0 upward; write the interpolated left/right
+    // xyz pair at `positions[off .. off+5]` (l.xyz then r.xyz). No tuple
+    // allocations in the inner loop.
+    const writeSample = (s: number, positions: Float32Array, off: number) => {
       let i = 0;
       while (i < nSmo - 1 && arc[i + 1] < s) i++;
-      const a = arc[i];
-      const b = arc[Math.min(nSmo - 1, i + 1)];
-      const t = b > a ? (s - a) / (b - a) : 0;
       const j = Math.min(nSmo - 1, i + 1);
-      const la = leftSmooth[i],  lb = leftSmooth[j];
-      const ra = rightSmooth[i], rb = rightSmooth[j];
-      return {
-        l: [
-          la[0] + (lb[0] - la[0]) * t,
-          la[1] + (lb[1] - la[1]) * t,
-          la[2] + (lb[2] - la[2]) * t,
-        ],
-        r: [
-          ra[0] + (rb[0] - ra[0]) * t,
-          ra[1] + (rb[1] - ra[1]) * t,
-          ra[2] + (rb[2] - ra[2]) * t,
-        ],
-      };
+      const a = arc[i];
+      const b = arc[j];
+      const t = b > a ? (s - a) / (b - a) : 0;
+      const iOff = i * 3, jOff = j * 3;
+      for (let k = 0; k < 3; k++) {
+        positions[off + k    ] =
+          leftSmooth [iOff + k] + (leftSmooth [jOff + k] - leftSmooth [iOff + k]) * t;
+        positions[off + k + 3] =
+          rightSmooth[iOff + k] + (rightSmooth[jOff + k] - rightSmooth[iOff + k]) * t;
+      }
     };
 
-    const positions: number[] = [];
+    // Worst-case size — each stripe contributes 4 vertices × 3 floats.
+    const positions = new Float32Array(count * 12);
     const indices:   number[] = [];
-    let base = 0;
+    let base = 0, floatIdx = 0;
     for (let s = 0; s < count; s++) {
       const sStart = offset + s * period;
       const sEnd   = Math.min(total, sStart + stripeW);
       if (sEnd <= sStart) continue;
-      const p0 = sampleAt(sStart);
-      const p1 = sampleAt(sEnd);
-      positions.push(
-        p0.l[0], p0.l[1], p0.l[2],
-        p0.r[0], p0.r[1], p0.r[2],
-        p1.l[0], p1.l[1], p1.l[2],
-        p1.r[0], p1.r[1], p1.r[2],
-      );
+      writeSample(sStart, positions, floatIdx);
+      writeSample(sEnd,   positions, floatIdx + 6);
       // Two triangles per stripe quad (doubled winding, DoubleSide render).
       indices.push(base + 0, base + 1, base + 3);
       indices.push(base + 0, base + 3, base + 2);
       base += 4;
+      floatIdx += 12;
     }
 
     if (indices.length === 0) return null;
+    // Trim the tail if any stripes were skipped (rare — only when period
+    // over-counts at the very end of a short crossing).
+    const positionAttr =
+      floatIdx === positions.length ? positions : positions.slice(0, floatIdx);
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geo.setAttribute("position", new THREE.BufferAttribute(positionAttr, 3));
     geo.setIndex(indices);
     return geo;
   }, [isCrosswalk, leftSmooth, rightSmooth, centerSmooth, nSmo, centerlineLength]);
+
+  useEffect(() => {
+    if (!stripeGeo) return;
+    return () => stripeGeo.dispose();
+  }, [stripeGeo]);
 
   const hoverHandlers = selectable
     ? {
@@ -319,8 +330,27 @@ function LaneletMesh({
   // Arrow sits at the last smooth sample, pointing along the final
   // smooth segment — so curved lanelets get a heading that tracks the
   // actual tangent at the tip, not the chord between control nodes.
-  const arrowStart = centerSmooth[nSmo - 2] ?? centerSmooth[0];
-  const arrowEnd   = centerSmooth[nSmo - 1];
+  // Boxing the xyz triples once per buffer change (cached via resolve
+  // cache in SceneViewer) keeps `DirectionArrow` and the handle/label
+  // consumers' prop identities stable across unrelated re-renders.
+  const arrowStart = useMemo<Vec3>(() => {
+    const i = Math.max(0, nSmo - 2) * 3;
+    return [centerSmooth[i], centerSmooth[i + 1], centerSmooth[i + 2]];
+  }, [centerSmooth, nSmo]);
+  const arrowEnd = useMemo<Vec3>(() => {
+    const i = (nSmo - 1) * 3;
+    return [centerSmooth[i], centerSmooth[i + 1], centerSmooth[i + 2]];
+  }, [centerSmooth, nSmo]);
+  // Midpoint — shared by the green move handle and the #id / lock-toggle
+  // label. Same cache story as arrow endpoints.
+  const midPos = useMemo<Vec3>(() => {
+    const i = Math.floor(nSmo / 2) * 3;
+    return [centerSmooth[i], centerSmooth[i + 1], centerSmooth[i + 2]];
+  }, [centerSmooth, nSmo]);
+  // drei's `<Line>` for the dashed centerline needs an array of 3-tuples,
+  // so box the packed buffer once per buffer change (same cache story as
+  // `BoundaryLine`'s `useVec3View`).
+  const centerSmoothVec3 = useVec3View(centerSmooth);
 
   return (
     <>
@@ -374,7 +404,7 @@ function LaneletMesh({
       {!isCrosswalk && (
         <>
           <Line
-            points={centerSmooth}
+            points={centerSmoothVec3}
             color={lineColor}
             lineWidth={selected ? 1.6 : 1.2}
             dashed
@@ -422,7 +452,7 @@ function LaneletMesh({
 
       {showHandles && (
         <MoveHandle
-          pos={centerSmooth[Math.floor(nSmo / 2)]}
+          pos={midPos}
           active={
             activeDragHandle?.kind === "move" &&
             activeDragHandle.id === lanelet.id
@@ -433,7 +463,7 @@ function LaneletMesh({
 
       {selected && (
         <LaneletIdLabel
-          pos={centerSmooth[Math.floor(nSmo / 2)]}
+          pos={midPos}
           id={lanelet.id}
           rectLocked={!!lanelet.straight}
           positionLocked={!!lanelet.positionLocked}
@@ -559,26 +589,37 @@ function LaneletIdLabel({
 // Boundary polyline — solid by default, dashed when lane change allowed.
 // ---------------------------------------------------------------------------
 interface BoundaryLineProps {
-  points:    Vec3[];
+  /** Packed xyz Float32Array (xyz per sample, `length = 3 * N`). */
+  points:    Float32Array;
   color:     string;
   lineWidth: number;
   dashed:    boolean;
 }
 
 function BoundaryLine({ points, color, lineWidth, dashed }: BoundaryLineProps) {
+  const n = points.length / 3;
+
   const dashSize = useMemo(() => {
     let len = 0;
-    for (let i = 0; i < points.length - 1; i++) {
-      const a = points[i];
-      const b = points[i + 1];
-      len += Math.hypot(b[0] - a[0], b[2] - a[2]);
+    for (let i = 0; i < n - 1; i++) {
+      const a = i * 3;
+      const b = (i + 1) * 3;
+      len += Math.hypot(points[b] - points[a], points[b + 2] - points[a + 2]);
     }
     return Math.max(0.2, len / 12);
-  }, [points]);
+  }, [points, n]);
+
+  // drei's `<Line>` needs an array of 3-tuples (or `Vector3` instances),
+  // so the Float32Array has to be boxed for the interface. We do it once
+  // per buffer change via useMemo: the per-lanelet resolve cache in
+  // SceneViewer keeps `points`' identity stable across unrelated
+  // re-renders, so this short-circuits and allocates no tuples during
+  // idle frames.
+  const pointsVec3 = useVec3View(points);
 
   return (
     <Line
-      points={points}
+      points={pointsVec3}
       color={color}
       lineWidth={lineWidth}
       transparent
@@ -588,6 +629,24 @@ function BoundaryLine({ points, color, lineWidth, dashed }: BoundaryLineProps) {
       {...(dashed ? { dashSize, gapSize: dashSize * 0.6 } : {})}
     />
   );
+}
+
+/**
+ * Materialise a packed xyz `Float32Array` (length `3 * N`) as a
+ * `[x, y, z][]` once per buffer identity. Thanks to the resolve cache,
+ * unchanged lanelets keep the same buffer reference across renders, so
+ * the boxed view is only built when the smooth samples actually changed.
+ */
+function useVec3View(buf: Float32Array): Vec3[] {
+  return useMemo(() => {
+    const n = buf.length / 3;
+    const out: Vec3[] = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const k = i * 3;
+      out[i] = [buf[k], buf[k + 1], buf[k + 2]];
+    }
+    return out;
+  }, [buf]);
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +670,8 @@ function LaneletHandle({ pos, active, interior, onPointerDown }: LaneletHandlePr
     );
     return g;
   }, [pos]);
+
+  useEffect(() => () => dotGeo.dispose(), [dotGeo]);
 
   const hitRef = useRef<THREE.Mesh>(null);
   const tmpVec = useMemo(() => new THREE.Vector3(), []);
@@ -716,6 +777,8 @@ function MoveHandle({ pos, active, onPointerDown }: MoveHandleProps) {
     return g;
   }, [pos]);
 
+  useEffect(() => () => dotGeo.dispose(), [dotGeo]);
+
   const hitRef = useRef<THREE.Mesh>(null);
   const tmpVec = useMemo(() => new THREE.Vector3(), []);
 
@@ -802,6 +865,8 @@ function JunctionMarkers({ positions }: JunctionMarkersProps) {
     return g;
   }, [positions]);
 
+  useEffect(() => () => geo.dispose(), [geo]);
+
   return (
     <>
       <points geometry={geo} renderOrder={RO_JUNCTION}>
@@ -847,6 +912,8 @@ function PendingStartMarker({
     );
     return g;
   }, [pos]);
+
+  useEffect(() => () => geo.dispose(), [geo]);
 
   const halo = attached ? "#f59e0b" : "#22d3ee";
   const core = attached ? "#fde68a" : "#ffffff";
@@ -905,6 +972,8 @@ function DirectionArrow({ start, end, size, color }: ArrowProps) {
     const angle = -Math.atan2(dz, dx);
     return { geometry: geo, rotY: angle };
   }, [start, end, size]);
+
+  useEffect(() => () => geometry.dispose(), [geometry]);
 
   return (
     <mesh

@@ -147,14 +147,20 @@ export interface ResolvedLanelet
    * ribbon, boundary lines and centerline — so curves look continuous
    * instead of showing a crease at every interior control node.
    *
-   * `leftSmooth` and `rightSmooth` always have the same length; their
-   * first sample coincides with the start control node and their last
-   * sample coincides with the end control node.
+   * Packed as one `Float32Array` of length `3 * N` (xyz per sample) instead
+   * of `N` separate `[x,y,z]` tuples: same information, ~5× less heap and
+   * no per-sample object allocation during the hot path of re-resolving a
+   * lanelet on every drag frame. Consumers read by index: sample `i` is
+   * `buf[i*3 + 0 .. i*3 + 2]`. Sample count = `buf.length / 3`.
+   *
+   * `leftSmooth` and `rightSmooth` always have the same length; sample 0
+   * coincides with the start control node and the last sample coincides
+   * with the end control node.
    */
-  leftSmooth:   Vec3[];
-  rightSmooth:  Vec3[];
-  /** Per-index midpoint of (leftSmooth, rightSmooth). */
-  centerSmooth: Vec3[];
+  leftSmooth:   Float32Array;
+  rightSmooth:  Float32Array;
+  /** Per-sample midpoint of (leftSmooth, rightSmooth); same packing. */
+  centerSmooth: Float32Array;
 
   /** Shortcut for centerline[0] (and centerSmooth[0]). */
   centerStart: Vec3;

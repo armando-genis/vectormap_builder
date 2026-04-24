@@ -36,7 +36,7 @@ import {
   getNode,
   getNodeOrNull,
   junctionNodeIds,
-  resolveAll,
+  resolveLanelet,
 } from "./lanelet/registry";
 import { downloadLanelet2Osm } from "./lanelet/export";
 import { saveSession, loadSessionFile } from "./session";
@@ -56,6 +56,19 @@ type CameraMode = "3d" | "2d";
 // "crop-center" = one-shot pick mode: next click on the PCD sets the Z-clip
 //                 region's center; the tool auto-returns to "view".
 type Tool       = "view" | "lanelet" | "crosswalk" | "crop-center";
+
+/**
+ * Reference-equality compare of two parallel Vec3 arrays. Used by the
+ * resolved-lanelet cache to detect whether any of a lanelet's boundary
+ * nodes have been replaced in the registry since the last resolve.
+ * Array length is expected to match — callers check that first.
+ */
+function refsEqual(a: Vec3[], b: Vec3[]): boolean {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 /**
  * Per-position ceiling height, mirroring the fragment shader in PointCloud.
@@ -1085,11 +1098,60 @@ export function SceneViewer({
 
   // --------------------------------------------------------------------
   // Derived: resolved lanelets + junction markers
+  //
+  // Per-lanelet memoization: resolveLanelet allocates Vec3[] arrays for
+  // leftSmooth/rightSmooth/centerSmooth (each ~130 samples for a 10-node
+  // lanelet) and runs a CatmullRomCurve3 per boundary. Doing that for all
+  // N lanelets on every node drag is wasteful *and* invalidates downstream
+  // useMemo deps (fillGeo, stripeGeo), which then leak BufferGeometries.
+  //
+  // We keep a cache keyed by lanelet id. A cached entry is reused iff the
+  // lanelet object's identity is unchanged AND every NodeId it references
+  // resolves to the same Vec3 object reference as last time. Since
+  // `moveNode` only replaces the entry for the moved id (spread otherwise
+  // preserves refs), this makes "drag one node" re-resolve only the
+  // lanelets actually touched, keeping the rest reference-stable.
   // --------------------------------------------------------------------
-  const resolvedLanelets = useMemo(
-    () => resolveAll(registry, lanelets),
-    [registry, lanelets]
-  );
+  const resolveCacheRef = useRef<
+    Map<number, { lanelet: Lanelet; nodeRefs: Vec3[]; resolved: ResolvedLanelet }>
+  >(new Map());
+
+  const resolvedLanelets = useMemo(() => {
+    const prev = resolveCacheRef.current;
+    const next = new Map<
+      number,
+      { lanelet: Lanelet; nodeRefs: Vec3[]; resolved: ResolvedLanelet }
+    >();
+    const out: ResolvedLanelet[] = new Array(lanelets.length);
+
+    for (let i = 0; i < lanelets.length; i++) {
+      const l = lanelets[i];
+      const totalNodes = l.leftBoundary.length + l.rightBoundary.length;
+      const refs: Vec3[] = new Array(totalNodes);
+      let k = 0;
+      for (const id of l.leftBoundary)  refs[k++] = getNode(registry, id);
+      for (const id of l.rightBoundary) refs[k++] = getNode(registry, id);
+
+      const cached = prev.get(l.id);
+      let resolved: ResolvedLanelet;
+      if (
+        cached &&
+        cached.lanelet === l &&
+        cached.nodeRefs.length === totalNodes &&
+        refsEqual(cached.nodeRefs, refs)
+      ) {
+        resolved = cached.resolved;
+      } else {
+        resolved = resolveLanelet(registry, l);
+      }
+
+      next.set(l.id, { lanelet: l, nodeRefs: refs, resolved });
+      out[i] = resolved;
+    }
+
+    resolveCacheRef.current = next;
+    return out;
+  }, [registry, lanelets]);
 
   const junctionPositions = useMemo<Vec3[]>(() => {
     const ids = junctionNodeIds(lanelets);

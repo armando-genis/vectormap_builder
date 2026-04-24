@@ -31,33 +31,46 @@ const SMOOTH_SAMPLES_PER_SEGMENT = 12;
  * exactly through every control point, doesn't cusp on sharp angles, and
  * degenerates gracefully for length-2 inputs (straight line).
  *
- * Output length = `samplesPerSegment * (ctrl.length - 1) + 1` for ctrl ≥ 2,
- * so the first and last samples coincide with the first and last control
- * nodes — important for the boundary polylines to start/end at the
- * junction NodeIds that neighbors share, so two connected lanelets'
- * rendered edges meet exactly at the seam.
+ * Output is a packed `Float32Array` of length `3 * (samplesPerSegment *
+ * (ctrl.length - 1) + 1)` for ctrl ≥ 2 — one `xyz` triple per sample. The
+ * first and last triples coincide with the first and last control nodes,
+ * so two connected lanelets' rendered edges meet exactly at the seam.
+ *
+ * Typed-array output avoids allocating a `[x,y,z]` tuple per sample, which
+ * at ~130 samples × 3 arrays × per-lanelet drag frame dominates GC
+ * pressure for large maps.
  */
 function smoothPolyline(
   ctrl: Vec3[],
   samplesPerSegment: number = SMOOTH_SAMPLES_PER_SEGMENT
-): Vec3[] {
-  if (ctrl.length < 2) return ctrl.map((p) => [p[0], p[1], p[2]] as Vec3);
+): Float32Array {
+  if (ctrl.length < 2) {
+    const out = new Float32Array(ctrl.length * 3);
+    for (let i = 0; i < ctrl.length; i++) {
+      out[i * 3    ] = ctrl[i][0];
+      out[i * 3 + 1] = ctrl[i][1];
+      out[i * 3 + 2] = ctrl[i][2];
+    }
+    return out;
+  }
   if (ctrl.length === 2) {
-    return [
-      [ctrl[0][0], ctrl[0][1], ctrl[0][2]],
-      [ctrl[1][0], ctrl[1][1], ctrl[1][2]],
-    ];
+    const out = new Float32Array(6);
+    out[0] = ctrl[0][0]; out[1] = ctrl[0][1]; out[2] = ctrl[0][2];
+    out[3] = ctrl[1][0]; out[4] = ctrl[1][1]; out[5] = ctrl[1][2];
+    return out;
   }
 
   const pts = ctrl.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
   const curve = new THREE.CatmullRomCurve3(pts, false, "centripetal", 0.5);
 
   const total = samplesPerSegment * (ctrl.length - 1);
-  const out: Vec3[] = new Array(total + 1);
+  const out = new Float32Array((total + 1) * 3);
   const v = new THREE.Vector3();
   for (let i = 0; i <= total; i++) {
     curve.getPoint(i / total, v);
-    out[i] = [v.x, v.y, v.z];
+    out[i * 3    ] = v.x;
+    out[i * 3 + 1] = v.y;
+    out[i * 3 + 2] = v.z;
   }
   return out;
 }
@@ -273,16 +286,13 @@ export function resolveLanelet(
   // ribbon edges it lives between.
   const leftSmooth  = smoothPolyline(leftPos);
   const rightSmooth = smoothPolyline(rightPos);
-  const m = leftSmooth.length;
-  const centerSmooth: Vec3[] = new Array(m);
-  for (let i = 0; i < m; i++) {
-    const lp = leftSmooth[i];
-    const rp = rightSmooth[i];
-    centerSmooth[i] = [
-      (lp[0] + rp[0]) * 0.5,
-      (lp[1] + rp[1]) * 0.5,
-      (lp[2] + rp[2]) * 0.5,
-    ];
+  // leftSmooth/rightSmooth are packed Float32Arrays (xyz per sample). The
+  // centerline sampling is just a per-channel average — no per-sample tuple
+  // allocation needed.
+  const flatLen = leftSmooth.length;
+  const centerSmooth = new Float32Array(flatLen);
+  for (let k = 0; k < flatLen; k++) {
+    centerSmooth[k] = (leftSmooth[k] + rightSmooth[k]) * 0.5;
   }
 
   return {
